@@ -39,6 +39,31 @@ class ReportGenerator:
         run_dir = get_run_dir(run_id)
         run_dir.mkdir(parents=True, exist_ok=True)
 
+        # Autoload persisted run artifacts if not passed directly
+        if plan is None and (run_dir / "plan.json").is_file():
+            try:
+                plan = ExecutionPlan.model_validate_json((run_dir / "plan.json").read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        if execution_result is None and (run_dir / "result.json").is_file():
+            try:
+                execution_result = ExecutionResult.model_validate_json((run_dir / "result.json").read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        if verification_result is None and (run_dir / "verification.json").is_file():
+            try:
+                verification_result = VerificationResult.model_validate_json((run_dir / "verification.json").read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
+        if cleanup_result is None and (run_dir / "cleanup.json").is_file():
+            try:
+                cleanup_result = CleanupResult.model_validate_json((run_dir / "cleanup.json").read_text(encoding="utf-8"))
+            except Exception:
+                pass
+
         meta = practical.metadata
         masked_acc = mask_account_id(account_id)
         now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")

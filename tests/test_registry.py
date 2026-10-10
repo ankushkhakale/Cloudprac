@@ -20,12 +20,17 @@ def test_normalize_practical_id():
 
 
 def test_registry_initialization():
-    """Verify registry starts with 8 placeholder practicals."""
+    """Verify registry starts with P01 configured and P02-P08 as placeholders."""
     reg = PracticalRegistry()
     ids = reg.list_ids()
     assert ids == [f"P{i:02d}" for i in range(1, 9)]
 
-    for pid in ids:
+    # P01 is now configured
+    assert reg.is_configured("P01")
+    assert reg.get("P01").metadata.status == PracticalStatus.CONFIGURED
+
+    # P02 through P08 remain unconfigured placeholders
+    for pid in [f"P{i:02d}" for i in range(2, 9)]:
         assert not reg.is_configured(pid)
         p = reg.get(pid)
         assert p is not None

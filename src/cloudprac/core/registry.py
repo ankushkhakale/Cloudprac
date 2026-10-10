@@ -33,8 +33,14 @@ class PracticalRegistry:
         self._register_placeholders()
 
     def _register_placeholders(self) -> None:
-        """Register default placeholder slots for P01 through P08."""
-        for i in range(1, 9):
+        """Register default practicals: P01 configured, P02-P08 as placeholders."""
+        try:
+            from cloudprac.practicals.p01.practical import P01Practical
+            self._practicals["P01"] = P01Practical()
+        except ImportError:
+            self._practicals["P01"] = PlaceholderPractical("P01")
+
+        for i in range(2, 9):
             pid = f"P{i:02d}"
             self._practicals[pid] = PlaceholderPractical(pid)
 

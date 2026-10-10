@@ -21,8 +21,14 @@ def mask_account_id(account_id: str) -> str:
 class AWSAdapter:
     """Manages AWS interactions, Boto3 sessions, and environment identification."""
 
-    def __init__(self, region_name: Optional[str] = None, mock_mode: Optional[bool] = None) -> None:
+    def __init__(
+        self,
+        region_name: Optional[str] = None,
+        profile_name: Optional[str] = None,
+        mock_mode: Optional[bool] = None,
+    ) -> None:
         self._region = region_name or os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+        self._profile = profile_name or os.environ.get("AWS_PROFILE")
         self._mock_mode = (
             mock_mode if mock_mode is not None
             else os.environ.get(ENV_MOCK_AWS, "0").lower() in ("1", "true", "yes")
@@ -39,10 +45,18 @@ class AWSAdapter:
         """Current AWS region."""
         return self._region
 
+    @property
+    def profile(self) -> Optional[str]:
+        """Configured AWS CLI profile."""
+        return self._profile
+
     def get_session(self) -> boto3.Session:
-        """Return Boto3 session utilizing ambient CloudShell credentials."""
+        """Return Boto3 session utilizing ambient CloudShell credentials or named profile."""
         if self._session is None:
-            self._session = boto3.Session(region_name=self._region)
+            session_kwargs: Dict[str, Any] = {"region_name": self._region}
+            if self._profile:
+                session_kwargs["profile_name"] = self._profile
+            self._session = boto3.Session(**session_kwargs)
         return self._session
 
     def get_client(self, service_name: str) -> Any:

@@ -1,5 +1,4 @@
-"""CloudPrac CLI entry point and command router using Typer."""
-
+import json
 import sys
 from typing import Optional
 import typer
@@ -100,6 +99,10 @@ def inspect_practical(
 @app.command("plan")
 def plan_practical(
     practical_id: str = typer.Argument(..., help="Practical ID (e.g. P01, 1)"),
+    region: Optional[str] = typer.Option(None, "--region", "-r", help="Target AWS region override."),
+    instance_type: Optional[str] = typer.Option(None, "--instance-type", "-t", help="EC2 instance type override."),
+    key_name: Optional[str] = typer.Option(None, "--key-name", "-k", help="EC2 key pair name override."),
+    ssh_cidr: Optional[str] = typer.Option(None, "--ssh-cidr", help="Allowed IPv4 CIDR range for SSH ingress."),
 ) -> None:
     """Generate a dry-run execution plan without modifying any AWS resources."""
     registry = get_registry()
@@ -109,6 +112,16 @@ def plan_practical(
     if not practical:
         print_error(f"Practical '{practical_id}' not found.")
         raise typer.Exit(1)
+
+    if hasattr(practical, "p01_config"):
+        if region:
+            practical.p01_config.region = region
+        if instance_type:
+            practical.p01_config.instance_type = instance_type
+        if key_name:
+            practical.p01_config.key_name = key_name
+        if ssh_cidr:
+            practical.p01_config.ssh_cidr = ssh_cidr
 
     config = load_config()
     planner = ExecutionPlanner(config)
@@ -131,6 +144,11 @@ def run_practical(
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt for safe execution."),
     no_verify: bool = typer.Option(False, "--no-verify", help="Skip automatic verification after execution."),
     auto_cleanup: bool = typer.Option(False, "--cleanup", help="Trigger cleanup immediately after run."),
+    region: Optional[str] = typer.Option(None, "--region", "-r", help="Target AWS region override."),
+    profile: Optional[str] = typer.Option(None, "--profile", "-p", help="AWS CLI profile name."),
+    instance_type: Optional[str] = typer.Option(None, "--instance-type", "-t", help="EC2 instance type override."),
+    key_name: Optional[str] = typer.Option(None, "--key-name", "-k", help="EC2 Key pair name override."),
+    ssh_cidr: Optional[str] = typer.Option(None, "--ssh-cidr", help="Allowed IPv4 CIDR range for SSH ingress."),
 ) -> None:
     """Safely execute a practical's AWS operations."""
     registry = get_registry()
@@ -149,18 +167,45 @@ def run_practical(
         )
         raise typer.Exit(1)
 
+    if hasattr(practical, "p01_config"):
+        if region:
+            practical.p01_config.region = region
+        if instance_type:
+            practical.p01_config.instance_type = instance_type
+        if key_name:
+            practical.p01_config.key_name = key_name
+        if ssh_cidr:
+            practical.p01_config.ssh_cidr = ssh_cidr
+
     config = load_config()
-    adapter = AWSAdapter(region_name=config.default_region)
+    target_region = region or config.default_region
+    adapter = AWSAdapter(region_name=target_region, profile_name=profile)
     engine = ExecutionEngine(config=config, adapter=adapter)
+
+    # 1. Preview dry-run plan
+    plan = engine.planner.plan(practical)
+    print_plan_table(plan)
+
+    # 2. Confirmation prompt if not --yes
+    if not yes:
+        console.print("[bold yellow]Caution:[/bold yellow] This practical will provision real AWS resources in your account.")
+        confirmed = typer.confirm("Do you approve this execution plan and wish to proceed?")
+        if not confirmed:
+            console.print("[dim]Execution cancelled by user. No cloud resources were modified.[/dim]")
+            raise typer.Exit(0)
 
     try:
         result = engine.run_practical(
             practical=practical,
+            run_id=plan.run_id,
             auto_verify=not no_verify,
             auto_cleanup=auto_cleanup,
         )
         if result.success:
             print_success(f"Practical {pid} executed successfully. Run ID: {result.run_id}")
+            if not no_verify:
+                console.print(f"[dim]Use [bold white]cloudprac report {pid} --run-id {result.run_id}[/bold white] to view submission report.[/dim]")
+                console.print(f"[dim]When lab demonstration is complete, run [bold white]cloudprac cleanup {pid} --run-id {result.run_id}[/bold white] to destroy provisioned resources.[/dim]\n")
         else:
             print_error(f"Execution encountered errors: {'; '.join(result.errors)}")
             raise typer.Exit(1)
@@ -173,6 +218,8 @@ def run_practical(
 def verify_practical(
     practical_id: str = typer.Argument(..., help="Practical ID (e.g. P01, 1)"),
     run_id: Optional[str] = typer.Option(None, "--run-id", help="Specific run ID to verify against."),
+    region: Optional[str] = typer.Option(None, "--region", "-r", help="Target AWS region override."),
+    profile: Optional[str] = typer.Option(None, "--profile", "-p", help="AWS CLI profile name."),
 ) -> None:
     """Verify postcondition states on AWS for an executed practical."""
     registry = get_registry()
@@ -191,7 +238,8 @@ def verify_practical(
         raise typer.Exit(1)
 
     config = load_config()
-    adapter = AWSAdapter(region_name=config.default_region)
+    target_region = region or config.default_region
+    adapter = AWSAdapter(region_name=target_region, profile_name=profile)
     verifier = VerificationEngine(adapter)
 
     try:
@@ -233,6 +281,8 @@ def cleanup_practical(
     practical_id: str = typer.Argument(..., help="Practical ID (e.g. P01, 1)"),
     run_id: str = typer.Option(..., "--run-id", help="Required Run ID whose manifest should be cleaned."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt."),
+    region: Optional[str] = typer.Option(None, "--region", "-r", help="Target AWS region override."),
+    profile: Optional[str] = typer.Option(None, "--profile", "-p", help="AWS CLI profile name."),
 ) -> None:
     """Safely destroy only the AWS resources provisioned during a specific run."""
     registry = get_registry()
@@ -256,14 +306,27 @@ def cleanup_practical(
         print_error(f"No run manifest found for Run ID '{run_id}'. Refusing unmanifested cleanup.")
         raise typer.Exit(1)
 
+    # Preview resources to be deleted
+    try:
+        manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        resources = manifest_data.get("resources", [])
+        if resources:
+            console.print(f"\n[bold yellow]Cleanup Preview for Run '{run_id}':[/bold yellow]")
+            for r in resources:
+                console.print(f"  • [red]DELETE[/red] {r.get('resource_type')}: [bold]{r.get('resource_id')}[/bold]")
+            console.print()
+    except Exception as e:
+        console.print(f"[dim]Could not preview manifest: {e}[/dim]")
+
     if not yes:
-        confirmed = typer.confirm(f"Are you sure you want to clean up resources from run {run_id}?")
+        confirmed = typer.confirm(f"Are you sure you want to clean up these resources from AWS?")
         if not confirmed:
-            console.print("[dim]Cleanup cancelled.[/dim]")
+            console.print("[dim]Cleanup cancelled. Resources were retained.[/dim]")
             raise typer.Exit(0)
 
     config = load_config()
-    adapter = AWSAdapter(region_name=config.default_region)
+    target_region = region or config.default_region
+    adapter = AWSAdapter(region_name=target_region, profile_name=profile)
     engine = ExecutionEngine(config=config, adapter=adapter)
 
     cleanup_res = engine.cleaner.cleanup(practical, run_id)

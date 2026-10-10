@@ -44,6 +44,8 @@ def print_practicals_table(practicals: List[PracticalContract]) -> None:
         meta = p.metadata
         if meta.status == PracticalStatus.NOT_CONFIGURED:
             status_badge = "[yellow]NOT CONFIGURED[/yellow]"
+        elif meta.status == PracticalStatus.CONFIGURED:
+            status_badge = "[bold green]CONFIGURED[/bold green]"
         elif meta.status == PracticalStatus.VERIFIED:
             status_badge = "[bold green]VERIFIED[/bold green]"
         elif meta.status == PracticalStatus.EXECUTED:
@@ -62,7 +64,7 @@ def print_practicals_table(practicals: List[PracticalContract]) -> None:
 
     console.print(table)
     console.print(
-        "\n[dim]* Note: Modules P01–P08 remain in [yellow]NOT CONFIGURED[/yellow] status "
+        "\n[dim]* Note: Modules P02–P08 remain in [yellow]NOT CONFIGURED[/yellow] status "
         "until college practical instructions are provided.[/dim]\n"
     )
 

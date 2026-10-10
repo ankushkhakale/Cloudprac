@@ -29,8 +29,18 @@ def test_cli_inspect_p01():
     result = runner.invoke(app, ["inspect", "P01"])
     assert result.exit_code == 0
     assert "Module ID: P01" in result.output
-    assert "NOT CONFIGURED" in result.output
+    assert "CONFIGURED" in result.output
     assert "Prerequisites" in result.output
+
+
+def test_cli_plan_configured_p01():
+    """Verify cloudprac plan P01 outputs dry-run plan successfully."""
+    result = runner.invoke(app, ["plan", "P01"])
+    assert result.exit_code == 0
+    assert "Execution Plan: P01" in result.output
+    assert "RUN_EC2_INSTANCE" in result.output
+    assert "CREATE_S3_BUCKET" in result.output
+    assert "CREATE_DYNAMODB_TABLE" in result.output
 
 
 def test_cli_inspect_invalid():
@@ -41,31 +51,31 @@ def test_cli_inspect_invalid():
 
 
 def test_cli_plan_unconfigured_blocks_safely():
-    """Verify cloudprac plan safely aborts on unconfigured practicals."""
-    result = runner.invoke(app, ["plan", "P01"])
+    """Verify cloudprac plan safely aborts on unconfigured practicals (e.g. P02)."""
+    result = runner.invoke(app, ["plan", "P02"])
     assert result.exit_code == 1
     assert "NOT CONFIGURED" in result.output
     assert "Accidental AWS resource creation was safely prevented" in result.output
 
 
 def test_cli_run_unconfigured_blocks_safely():
-    """Verify cloudprac run safely aborts on unconfigured practicals."""
-    result = runner.invoke(app, ["run", "P01"])
+    """Verify cloudprac run safely aborts on unconfigured practicals (e.g. P02)."""
+    result = runner.invoke(app, ["run", "P02"])
     assert result.exit_code == 1
     assert "NOT CONFIGURED" in result.output
     assert "Execution is locked to prevent creating unintentional AWS resources" in result.output
 
 
 def test_cli_verify_unconfigured_blocks_safely():
-    """Verify cloudprac verify safely aborts on unconfigured practicals."""
-    result = runner.invoke(app, ["verify", "P01"])
+    """Verify cloudprac verify safely aborts on unconfigured practicals (e.g. P02)."""
+    result = runner.invoke(app, ["verify", "P02"])
     assert result.exit_code == 1
     assert "NOT CONFIGURED" in result.output
 
 
 def test_cli_cleanup_unconfigured_blocks_safely():
-    """Verify cloudprac cleanup safely aborts on unconfigured practicals."""
-    result = runner.invoke(app, ["cleanup", "P01", "--run-id", "test-run"])
+    """Verify cloudprac cleanup safely aborts on unconfigured practicals (e.g. P02)."""
+    result = runner.invoke(app, ["cleanup", "P02", "--run-id", "test-run"])
     assert result.exit_code == 1
     assert "NOT CONFIGURED" in result.output
 
