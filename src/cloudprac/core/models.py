@@ -63,6 +63,7 @@ class ExecutionPlan(BaseModel):
 
     practical_id: str
     run_id: str
+    aws_region: str = "us-east-1"
     created_at: str = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
@@ -109,6 +110,7 @@ class ExecutionResult(BaseModel):
     steps_executed: int = 0
     manifest: Optional[RunManifest] = None
     errors: List[str] = Field(default_factory=list)
+    outputs: Dict[str, Any] = Field(default_factory=dict)
 
 
 class VerificationCheck(BaseModel):

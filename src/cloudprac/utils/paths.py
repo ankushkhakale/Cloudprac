@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+from typing import Any, Dict, List
 
 ENV_CLOUDPRAC_HOME = "CLOUDPRAC_HOME"
 
@@ -60,3 +61,46 @@ def save_restricted_file(file_path: Path, content: str) -> Path:
     else:
         file_path.write_text(content, encoding="utf-8")
     return file_path
+
+
+def list_all_runs() -> List[Dict[str, Any]]:
+    """Discover all recorded execution runs from ~/.cloudprac/runs.
+
+    Returns a list of run metadata dictionaries, sorted newest first.
+    """
+    import json
+
+    runs_dir = get_runs_dir()
+    if not runs_dir.exists():
+        return []
+
+    runs: List[Dict[str, Any]] = []
+    for item in runs_dir.iterdir():
+        if item.is_dir():
+            manifest_file = item / "manifest.json"
+            if manifest_file.is_file():
+                try:
+                    data = json.loads(manifest_file.read_text(encoding="utf-8"))
+                    runs.append(
+                        {
+                            "run_id": data.get("run_id", item.name),
+                            "practical_id": data.get("practical_id", "Unknown"),
+                            "started_at": data.get("started_at", ""),
+                            "aws_region": data.get("aws_region", ""),
+                            "resource_count": len(data.get("resources", [])),
+                            "path": str(item),
+                        }
+                    )
+                except Exception:
+                    runs.append(
+                        {
+                            "run_id": item.name,
+                            "practical_id": "Unknown",
+                            "started_at": "",
+                            "aws_region": "",
+                            "resource_count": 0,
+                            "path": str(item),
+                        }
+                    )
+    runs.sort(key=lambda r: (r.get("started_at", ""), r.get("run_id", "")), reverse=True)
+    return runs

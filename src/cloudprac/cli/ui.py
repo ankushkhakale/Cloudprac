@@ -1,6 +1,6 @@
 """Rich terminal user interface styling and layout for CloudPrac."""
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from rich.console import Console
 from rich.panel import Panel
@@ -191,3 +191,73 @@ def print_success(message: str) -> None:
 def print_warning(message: str) -> None:
     """Print warning panel."""
     console.print(Panel(f"[bold yellow]Warning:[/bold yellow] {message}", border_style="yellow"))
+
+
+def print_p05_demonstration_guide(
+    run_id: str,
+    public_ip: str,
+    app_port: int = 5000,
+    token_file_path: Optional[str] = None,
+    key_file_path: Optional[str] = None,
+) -> None:
+    """Render practical demonstration instructions for students and evaluators.
+
+    Security Requirement:
+    Administrative tokens MUST NEVER be transmitted over unencrypted HTTP across the internet.
+    Instead, secure administrative operations are demonstrated via encrypted SSH loopback
+    or encrypted SSH port-forwarding tunnels.
+    """
+    url = f"http://{public_ip}:{app_port}"
+    key_disp = key_file_path or f"~/.cloudprac/keys/cloudprac-p05-key-{run_id}.pem"
+    token_read = f"cat {token_file_path}" if token_file_path else f"cat ~/.cloudprac/runs/{run_id}/admin_token"
+
+    content = Text()
+    content.append("🎓 Student Lab Demonstration Guide\n", style="bold green")
+    content.append("Your application is operational and sample student records are active in DynamoDB.\n\n", style="white")
+
+    content.append("1. Web Application Public Inspection (Read-Only):\n", style="bold cyan")
+    content.append(f"   URL: {url}\n", style="bold white underline")
+    content.append(f"   Health Check: curl -s {url}/health\n", style="bold yellow")
+    content.append(f"   List Students: curl -s {url}/api/students\n", style="bold yellow")
+    content.append(f"   Retrieve Document: curl -s {url}/api/students/STU-001/document\n\n", style="bold yellow")
+
+    content.append("2. Secure Authenticated Administration (Encrypted in Transit):\n", style="bold cyan")
+    content.append("   🔒 Security Notice: Admin tokens must NEVER be sent over unencrypted HTTP.\n", style="yellow")
+    content.append("   Use either of the two encrypted methods below:\n\n", style="dim")
+
+    content.append("   Method A — Encrypted SSH Remote Execution (Zero Overhead):\n", style="bold green")
+    content.append(
+        f"   ssh -i {key_disp} ec2-user@{public_ip} \\\n"
+        f"     'curl -s -X POST http://127.0.0.1:{app_port}/api/students \\\n"
+        f'        -H "Content-Type: application/json" \\\n'
+        f"        -H \"X-Admin-Token: $(sudo grep ADMIN_TOKEN /opt/cloudprac/.env | cut -d= -f2)\" \\\n"
+        f'        -d \'{{"student_id":"S1099","name":"Demonstration Student","course":"Cloud Computing","year":"4"}}\'\'\n\n',
+        style="bold yellow",
+    )
+
+    content.append("   Method B — Encrypted SSH Local Port Forwarding Tunnel:\n", style="bold green")
+    content.append(
+        f"   # 1. Open encrypted SSH background tunnel\n"
+        f"   ssh -i {key_disp} -N -L {app_port}:127.0.0.1:{app_port} ec2-user@{public_ip} &\n"
+        f"   # 2. Transmit authenticated mutation through encrypted tunnel\n"
+        f"   curl -s -X POST http://127.0.0.1:{app_port}/api/students \\\n"
+        f'     -H "Content-Type: application/json" \\\n'
+        f'     -H "X-Admin-Token: $({token_read})" \\\n'
+        f'     -d \'{{"student_id":"S1099","name":"Demonstration Student","course":"Cloud Computing","year":"4"}}\'\n\n',
+        style="bold yellow",
+    )
+
+    content.append("3. Generate Evidence Report for Lab Submission:\n", style="bold cyan")
+    content.append(f"   cloudprac report P05 --run-id {run_id}\n\n", style="bold yellow")
+
+    content.append("4. Clean Up All AWS Resources When Done:\n", style="bold cyan")
+    content.append(f"   cloudprac cleanup P05 --run-id {run_id}\n", style="bold red")
+
+    console.print(
+        Panel(
+            content,
+            title=f"Practical P05 Demonstration — Run {run_id}",
+            border_style="green",
+            padding=(1, 2),
+        )
+    )

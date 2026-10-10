@@ -166,6 +166,35 @@ def is_running_in_cloudshell() -> bool:
     return False
 
 
+def detect_public_ip(timeout: float = 2.0) -> Optional[str]:
+    """Detect current public/egress IP via AWS checkip or fallback service.
+
+    Returns a '/32' CIDR string if detected, or None if offline or unreachable.
+    """
+    import ipaddress
+    import urllib.request
+
+    endpoints = [
+        "https://checkip.amazonaws.com",
+        "https://api.ipify.org",
+    ]
+    for url in endpoints:
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "CloudPrac/Preflight"},
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if resp.status == 200:
+                    raw_ip = resp.read().decode("utf-8").strip()
+                    parsed = ipaddress.ip_address(raw_ip)
+                    if isinstance(parsed, ipaddress.IPv4Address) and not parsed.is_private and not parsed.is_loopback:
+                        return f"{raw_ip}/32"
+        except Exception:
+            continue
+    return None
+
+
 def run_preflight_checks(adapter: Optional[AWSAdapter] = None) -> PreflightReport:
     """Execute all preflight environment diagnostics."""
     act_adapter = adapter or AWSAdapter()

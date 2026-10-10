@@ -54,7 +54,7 @@ from cloudprac.practicals.p05.sample_data import (
 )
 from cloudprac.utils.config import CloudPracConfig
 from cloudprac.utils.logging import get_logger
-from cloudprac.utils.paths import get_run_dir, save_restricted_file
+from cloudprac.utils.paths import get_cloudprac_home, get_run_dir, save_restricted_file
 
 logger = get_logger()
 
@@ -192,9 +192,11 @@ class P05Practical(PracticalContract):
             ),
         ]
 
+        target_region = self.p05_config.region or getattr(config, "default_region", "us-east-1")
         return ExecutionPlan(
             practical_id="P05",
             run_id=run_id,
+            aws_region=target_region,
             steps=steps,
             estimated_total_cost="Unverified exact cost - billable AWS resources deployed (EC2 compute, EBS gp3, public IPv4, S3, DynamoDB). Not guaranteed to be free; tear down promptly via 'cloudprac cleanup P05'.",
             warnings=[
@@ -205,17 +207,14 @@ class P05Practical(PracticalContract):
             ],
         )
 
-
     def execute(self, plan: ExecutionPlan, context: Any) -> ExecutionResult:
         """Execute the planned AWS provisioning sequence safely."""
         adapter: AWSAdapter = context if isinstance(context, AWSAdapter) else getattr(context, "adapter", None)
         if not adapter:
             raise RuntimeError("Execution context missing valid AWSAdapter.")
 
-
-
         clean_run = sanitize_name(plan.run_id)
-        region = self.p05_config.region or adapter.region_name
+        region = plan.aws_region or self.p05_config.region or adapter.region_name
         identity = adapter.get_caller_identity()
         raw_account = identity.get("Account", "unknown")
         account_id = mask_account_id(raw_account).replace("*", "x")
@@ -296,6 +295,8 @@ class P05Practical(PracticalContract):
             save_restricted_file(run_dir / "admin_token", mock_token)
             manifest_path = run_dir / "manifest.json"
             manifest_path.write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
+            k_name = self.p05_config.key_name or f"cloudprac-p05-key-{clean_run}"
+            key_file = get_cloudprac_home() / "keys" / f"{k_name}.pem"
             return ExecutionResult(
                 practical_id="P05",
                 run_id=plan.run_id,
@@ -303,10 +304,20 @@ class P05Practical(PracticalContract):
                 message="P05 mock execution completed successfully",
                 steps_executed=len(mock_resources),
                 manifest=manifest,
+                outputs={
+                    "public_ip": "198.51.100.25",
+                    "app_port": self.p05_config.app_port,
+                    "app_url": f"http://198.51.100.25:{self.p05_config.app_port}",
+                    "bucket_name": bucket_name,
+                    "table_name": table_name,
+                    "key_name": k_name,
+                    "key_file": str(key_file),
+                },
             )
 
         tracked_resources: List[TrackedResource] = []
         errors: List[str] = []
+        public_ip = ""
 
         # Validate explicit restricted CIDR before any cloud resource provisioning
         if not self.p05_config.app_cidr or self.p05_config.app_cidr.strip() in ("0.0.0.0/0", "::/0") or self.p05_config.app_cidr.strip().endswith("/0"):
@@ -332,7 +343,7 @@ class P05Practical(PracticalContract):
         # ---------------------------------------------------------
         # 1. Provision Amazon S3 Private Bucket & Documents
         # ---------------------------------------------------------
-        s3_client = adapter.get_client("s3")
+        s3_client = adapter.get_client("s3", region_name=region)
         try:
             logger.info("Step 1: Provisioning Amazon S3 private bucket...")
             created_bucket = create_private_bucket(
@@ -400,7 +411,7 @@ class P05Practical(PracticalContract):
         # ---------------------------------------------------------
         # 2. Provision Amazon DynamoDB Student Table & Records
         # ---------------------------------------------------------
-        dynamodb_client = adapter.get_client("dynamodb")
+        dynamodb_client = adapter.get_client("dynamodb", region_name=region)
         try:
             logger.info("Step 2: Provisioning Amazon DynamoDB table...")
             created_table = create_student_table(
@@ -444,7 +455,7 @@ class P05Practical(PracticalContract):
         # ---------------------------------------------------------
         # 3. Provision IAM Role & Instance Profile for EC2
         # ---------------------------------------------------------
-        iam_client = adapter.get_client("iam")
+        iam_client = adapter.get_client("iam", region_name=region)
         try:
             logger.info("Step 3: Setting up IAM Role and Instance Profile...")
             created_profile = setup_instance_profile(
@@ -483,8 +494,10 @@ class P05Practical(PracticalContract):
         # ---------------------------------------------------------
         # 4. Provision EC2 Networking, Security Group, and Key Pair
         # ---------------------------------------------------------
-        ec2_client = adapter.get_client("ec2")
-        ssm_client = adapter.get_client("ssm")
+        ec2_client = adapter.get_client("ec2", region_name=region)
+        ssm_client = adapter.get_client("ssm", region_name=region)
+        key_file = None
+        k_name = self.p05_config.key_name or f"cloudprac-p05-key-{clean_run}"
         try:
             logger.info("Step 4: Setting up EC2 networking and security group...")
             vpc_id, subnet_id = get_default_or_first_vpc(ec2_client)
@@ -492,14 +505,14 @@ class P05Practical(PracticalContract):
             # Discover AL2023 AMI dynamically
             ami_id = self.p05_config.ami_id or find_latest_al2023_ami(ec2_client, ssm_client)
 
-            # Security group with app port
+            # Security group with app port and SSH restricted to student's CIDR
             sg_id = setup_security_group(
                 ec2_client=ec2_client,
                 group_name=sg_name,
                 vpc_id=vpc_id,
                 app_port=self.p05_config.app_port,
                 app_cidr=self.p05_config.app_cidr,
-                ssh_cidr=self.p05_config.ssh_cidr,
+                ssh_cidr=self.p05_config.ssh_cidr or self.p05_config.app_cidr,
                 tags=tags,
             )
             tracked_resources.append(
@@ -514,7 +527,7 @@ class P05Practical(PracticalContract):
 
             # Key Pair
             if self.p05_config.create_key_pair:
-                k_name, _ = setup_key_pair(
+                k_name, key_file = setup_key_pair(
                     ec2_client=ec2_client,
                     key_name=key_name,
                     save_local_file=self.p05_config.save_key_file,
@@ -530,6 +543,9 @@ class P05Practical(PracticalContract):
                 checkpoint_manifest()
             else:
                 k_name = self.p05_config.key_name
+                disk_key = get_cloudprac_home() / "keys" / f"{k_name}.pem"
+                if disk_key.exists():
+                    key_file = disk_key
 
             # Build user-data bootstrap script fetching admin token via S3 + IAM role
             token_s3_key = f"secrets/{plan.run_id}/admin_token"
@@ -569,7 +585,10 @@ class P05Practical(PracticalContract):
 
             # Wait for instance running state
             logger.info(f"Waiting for instance '{instance_id}' to enter 'running' state...")
-            wait_for_instance_running(ec2_client, instance_id)
+            inst_data = wait_for_instance_running(ec2_client, instance_id)
+            public_ip = inst_data.get("PublicIpAddress", "")
+            if public_ip:
+                logger.info(f"EC2 instance is running at public IP: {public_ip}")
 
         except Exception as e:
             logger.error(f"EC2 provisioning failed: {e}")
@@ -588,6 +607,18 @@ class P05Practical(PracticalContract):
         manifest_path = run_dir / "manifest.json"
         manifest_path.write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
 
+        outputs = {}
+        if public_ip:
+            outputs = {
+                "public_ip": public_ip,
+                "app_port": self.p05_config.app_port,
+                "app_url": f"http://{public_ip}:{self.p05_config.app_port}",
+                "bucket_name": bucket_name,
+                "table_name": table_name,
+                "key_name": k_name,
+                "key_file": str(key_file) if key_file else None,
+            }
+
         success = len(errors) == 0
         return ExecutionResult(
             practical_id="P05",
@@ -597,6 +628,7 @@ class P05Practical(PracticalContract):
             steps_executed=len(tracked_resources),
             errors=errors,
             manifest=manifest,
+            outputs=outputs,
         )
 
 

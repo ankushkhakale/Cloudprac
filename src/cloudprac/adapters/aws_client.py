@@ -66,9 +66,10 @@ class AWSAdapter:
             self._session = boto3.Session(**session_kwargs)
         return self._session
 
-    def get_client(self, service_name: str) -> Any:
-        """Create a Boto3 service client."""
-        return self.get_session().client(service_name)
+    def get_client(self, service_name: str, region_name: Optional[str] = None) -> Any:
+        """Create a Boto3 service client for the configured or requested region."""
+        target_region = region_name or self._region
+        return self.get_session().client(service_name, region_name=target_region)
 
     def get_caller_identity(self) -> Dict[str, Any]:
         """Fetch caller identity using STS without storing or logging credentials."""

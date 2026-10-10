@@ -1,4 +1,5 @@
 import json
+import sys
 from typing import Any, Optional
 
 import typer
@@ -6,11 +7,16 @@ from rich.console import Console
 
 from cloudprac.__version__ import __version__
 from cloudprac.adapters.aws_client import AWSAdapter
-from cloudprac.adapters.preflight import is_running_in_cloudshell, run_preflight_checks
+from cloudprac.adapters.preflight import (
+    detect_public_ip,
+    is_running_in_cloudshell,
+    run_preflight_checks,
+)
 from cloudprac.cli.ui import (
     print_banner,
     print_error,
     print_inspect_panel,
+    print_p05_demonstration_guide,
     print_plan_table,
     print_practicals_table,
     print_preflight_table,
@@ -66,8 +72,15 @@ def main(
     """CloudPrac — AWS Cloud Computing Practical Automation Engine."""
     setup_logging(verbose=verbose)
     if ctx.invoked_subcommand is None:
-        print_banner(is_cloudshell=is_running_in_cloudshell())
-        console.print("[dim]Use [bold white]cloudprac --help[/bold white] or [bold white]cloudprac list[/bold white] to view available practicals.[/dim]\n")
+        if sys.stdin.isatty():
+            from cloudprac.cli.menu import interactive_menu
+
+            interactive_menu()
+        else:
+            print_banner(is_cloudshell=is_running_in_cloudshell())
+            console.print(
+                "[dim]Use [bold white]cloudprac --help[/bold white] or [bold white]cloudprac list[/bold white] to view available practicals.[/dim]\n"
+            )
 
 
 @app.command("list")
@@ -120,6 +133,21 @@ def _apply_cli_overrides(
             cfg.app_port = app_port
         if app_cidr is not None and hasattr(cfg, "app_cidr"):
             cfg.app_cidr = app_cidr
+        elif hasattr(cfg, "app_cidr") and not cfg.app_cidr:
+            # Automatically detect egress IP for student convenience
+            detected = detect_public_ip()
+            if detected:
+                cfg.app_cidr = detected
+            elif AWSAdapter().mock_mode:
+                cfg.app_cidr = "192.0.2.1/32"
+
+
+@app.command("menu")
+def menu_command() -> None:
+    """Launch the interactive student TUI menu."""
+    from cloudprac.cli.menu import interactive_menu
+
+    interactive_menu()
 
 
 @app.command("plan")
@@ -234,6 +262,21 @@ def run_practical(
         )
         if result.success:
             print_success(f"Practical {pid} executed successfully. Run ID: {result.run_id}")
+            if pid.upper() == "P05":
+                public_ip = result.outputs.get("public_ip", "198.51.100.25")
+                app_port = result.outputs.get(
+                    "app_port", getattr(getattr(practical, "p05_config", None), "app_port", 5000)
+                )
+                run_dir = get_run_dir(result.run_id)
+                token_file = run_dir / "admin_token"
+                token_path_str = str(token_file) if token_file.exists() else None
+                print_p05_demonstration_guide(
+                    run_id=result.run_id,
+                    public_ip=public_ip,
+                    app_port=app_port,
+                    token_file_path=token_path_str,
+                    key_file_path=result.outputs.get("key_file"),
+                )
             if not no_verify:
                 console.print(f"[dim]Use [bold white]cloudprac report {pid} --run-id {result.run_id}[/bold white] to view submission report.[/dim]")
                 console.print(f"[dim]When lab demonstration is complete, run [bold white]cloudprac cleanup {pid} --run-id {result.run_id}[/bold white] to destroy provisioned resources.[/dim]\n")
@@ -356,7 +399,8 @@ def cleanup_practical(
             raise typer.Exit(0)
 
     config = load_config()
-    target_region = region or config.default_region
+    manifest_region = manifest_data.get("aws_region") if "manifest_data" in locals() and isinstance(manifest_data, dict) else None
+    target_region = region or manifest_region or config.default_region
     adapter = AWSAdapter(region_name=target_region, profile_name=profile)
     engine = ExecutionEngine(config=config, adapter=adapter)
 

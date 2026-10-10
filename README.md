@@ -111,11 +111,20 @@ Student / Browser ─┼─► Port 5000: Flask Web App (systemd service) │
 
 ## 4. Quickstart & Installation
 
-### Prerequisites
-- Python 3.10+
-- AWS CloudShell or local terminal with AWS CLI v2 and active IAM credentials
+### One-Command AWS CloudShell Experience (Recommended for Students)
 
-### Installation
+Open **AWS CloudShell** in the AWS Management Console and execute:
+```bash
+bash <(curl -sSL https://raw.githubusercontent.com/ankushkhakale/Cloudprac/main/install.sh)
+```
+Or clone and run the installer locally:
+```bash
+git clone https://github.com/ankushkhakale/Cloudprac.git
+cd Cloudprac
+./install.sh
+```
+
+The installer verifies your Python environment (3.10+), installs CloudPrac to your user path (`~/.local/bin`), verifies active ambient IAM credentials, and immediately launches the **CloudPrac Interactive Menu**.
 
 #### Development / Local Install:
 ```bash
@@ -128,7 +137,27 @@ pip install -e .
 
 ---
 
-## 5. Step-by-Step P05 Workflow
+## 5. Student Workflow: Interactive TUI Menu
+
+Running `cloudprac` without subcommands in an interactive terminal (or explicitly via `cloudprac menu`) opens the student lab suite:
+
+```
+  [1] Run Practical P05        — Fully automated EC2 + S3 + DynamoDB student management lab
+  [2] Preview P05 Plan         — Dry-run preview of AWS resources without deploying
+  [3] Verify Deployment        — Run automated health and state assertions on active AWS resources
+  [4] Generate Lab Report      — Produce formatted Markdown & JSON submission report
+  [5] Clean Up Cloud Resources — Safely destroy resources created during a lab run
+  [6] View Syllabus Practicals — Inspect all P01–P08 college syllabus practical modules
+  [7] Run Preflight Diagnostics— Test CloudShell environment, Python, and AWS credentials
+  [0] Exit
+```
+
+### Automatic Egress IP Discovery & Restricted Security Groups
+Students do not need to look up their public IP address manually. CloudPrac automatically contacts AWS `checkip.amazonaws.com`, validates the public IPv4 address, and provisions the Security Group ingress rule strictly for `<your-ip>/32`. Students can accept the detected IP with one keystroke (Enter) or pass a custom CIDR. Broad `0.0.0.0/0` exposure is strictly rejected.
+
+---
+
+## 6. Step-by-Step CLI Workflow (Command-Line Mode)
 
 ### Step 1: Preflight Check
 Verify Python environment, AWS CLI, and active STS identity:
@@ -217,14 +246,20 @@ To execute P05, the student's IAM identity needs permissions for:
 - **Admin Authentication**: Mutating API operations (`POST`, `PUT`, `DELETE`) require token authentication via the `X-Admin-Token` header or `Authorization: Bearer <token>`. Query-string authentication (`?token=...`) is strictly rejected to prevent credentials from being recorded in web access logs.
 - **Secure Secret Delivery**: The admin token is never embedded in EC2 user data, bootstrap scripts, or console logs. For each run, a unique 32-byte cryptographically secure token is generated, stored in the private S3 bucket, and fetched at runtime by the EC2 instance using attached IAM instance profile credentials.
 - **Local Credential Storage**: The token is saved locally to `~/.cloudprac/runs/<run_id>/admin_token` with `0600` permissions (restricted strictly to the current user).
+- **Encrypted Administrative Access**: Administrative tokens must **never** be sent over unencrypted HTTP across the internet. Use either of the two low-friction, secure methods:
   ```bash
-  # Retrieve the generated token from the local run directory:
-  TOKEN=$(cat ~/.cloudprac/runs/<run_id>/admin_token)
+  # Method A: Encrypted SSH Remote Execution (Zero overhead, token never leaves host)
+  ssh -i ~/.cloudprac/keys/<key_name>.pem ec2-user@<EC2-IP> \
+    'curl -s -X POST http://127.0.0.1:5000/api/students \
+       -H "Content-Type: application/json" \
+       -H "X-Admin-Token: $(sudo grep ADMIN_TOKEN /opt/cloudprac/.env | cut -d= -f2)" \
+       -d "{\"student_id\": \"STU-105\", \"name\": \"Kavya Menon\", \"course\": \"B.Tech CS\"}"'
 
-  # Example authorized student creation using headers only:
-  curl -X POST http://<EC2-IP>:5000/api/students \
+  # Method B: Encrypted SSH Local Port Forwarding Tunnel
+  ssh -i ~/.cloudprac/keys/<key_name>.pem -N -L 5000:127.0.0.1:5000 ec2-user@<EC2-IP> &
+  curl -s -X POST http://127.0.0.1:5000/api/students \
     -H "Content-Type: application/json" \
-    -H "X-Admin-Token: ${TOKEN}" \
+    -H "X-Admin-Token: $(cat ~/.cloudprac/runs/<run_id>/admin_token)" \
     -d '{"student_id": "STU-105", "name": "Kavya Menon", "course": "B.Tech CS"}'
   ```
 
