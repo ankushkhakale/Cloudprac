@@ -46,6 +46,12 @@ class AWSAdapter:
         return self._region
 
     @property
+    def region_name(self) -> str:
+        """Alias for region."""
+        return self._region
+
+
+    @property
     def profile(self) -> Optional[str]:
         """Configured AWS CLI profile."""
         return self._profile

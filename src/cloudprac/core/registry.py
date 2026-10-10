@@ -33,14 +33,21 @@ class PracticalRegistry:
         self._register_placeholders()
 
     def _register_placeholders(self) -> None:
-        """Register default practicals: P01 configured, P02-P08 as placeholders."""
-        try:
-            from cloudprac.practicals.p01.practical import P01Practical
-            self._practicals["P01"] = P01Practical()
-        except ImportError:
-            self._practicals["P01"] = PlaceholderPractical("P01")
+        """Register default practicals: P05 configured, P01-P04 and P06-P08 as placeholders."""
+        # P01 to P04 are placeholders (P01 is local VMware/Ubuntu practical)
+        for i in range(1, 5):
+            pid = f"P{i:02d}"
+            self._practicals[pid] = PlaceholderPractical(pid)
 
-        for i in range(2, 9):
+        # P05 is the official AWS Student Record Management practical
+        try:
+            from cloudprac.practicals.p05.practical import P05Practical
+            self._practicals["P05"] = P05Practical()
+        except ImportError:
+            self._practicals["P05"] = PlaceholderPractical("P05")
+
+        # P06 to P08 are placeholders
+        for i in range(6, 9):
             pid = f"P{i:02d}"
             self._practicals[pid] = PlaceholderPractical(pid)
 

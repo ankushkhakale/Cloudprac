@@ -28,10 +28,16 @@ class ExecutionPlanner:
     def plan(self, practical: PracticalContract, run_id: Optional[str] = None) -> ExecutionPlan:
         """Create a dry-run execution plan for a practical."""
         if practical.metadata.status == PracticalStatus.NOT_CONFIGURED:
+            if getattr(practical, "is_local", False):
+                raise PracticalNotConfiguredError(
+                    f"Practical {practical.metadata.id} is a local virtualization practical (VMware/Ubuntu). "
+                    "It cannot be planned or run inside AWS CloudShell."
+                )
             raise PracticalNotConfiguredError(
                 f"Practical {practical.metadata.id} is NOT CONFIGURED. "
                 "Cannot generate an execution plan until syllabus instructions are provided."
             )
+
 
         active_run_id = run_id or generate_run_id(practical.metadata.id)
         plan = practical.plan(self.config, active_run_id)

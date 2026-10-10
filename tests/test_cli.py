@@ -16,31 +16,50 @@ def test_cli_version():
 
 
 def test_cli_list_contains_all_placeholders():
-    """Verify cloudprac list displays P01 through P08 as NOT CONFIGURED."""
+    """Verify cloudprac list displays P01 through P08 with P05 CONFIGURED and others NOT CONFIGURED."""
     result = runner.invoke(app, ["list"])
     assert result.exit_code == 0
     for i in range(1, 9):
         assert f"P{i:02d}" in result.output
+    assert "CONFIGURED" in result.output
     assert "NOT CONFIGURED" in result.output
 
 
-def test_cli_inspect_p01():
-    """Verify cloudprac inspect P01 details."""
-    result = runner.invoke(app, ["inspect", "P01"])
+def test_cli_inspect_p05():
+    """Verify cloudprac inspect P05 details."""
+    result = runner.invoke(app, ["inspect", "P05"])
     assert result.exit_code == 0
-    assert "Module ID: P01" in result.output
+    assert "Module ID: P05" in result.output
     assert "CONFIGURED" in result.output
+    assert "Student Record Management" in result.output
     assert "Prerequisites" in result.output
 
 
-def test_cli_plan_configured_p01():
-    """Verify cloudprac plan P01 outputs dry-run plan successfully."""
-    result = runner.invoke(app, ["plan", "P01"])
+def test_cli_inspect_p01():
+    """Verify cloudprac inspect P01 details reflects local VMware lab."""
+    result = runner.invoke(app, ["inspect", "P01"])
     assert result.exit_code == 0
-    assert "Execution Plan: P01" in result.output
-    assert "RUN_EC2_INSTANCE" in result.output
-    assert "CREATE_S3_BUCKET" in result.output
-    assert "CREATE_DYNAMODB_TABLE" in result.output
+    assert "Module ID: P01" in result.output
+    assert "NOT CONFIGURED" in result.output
+    assert "VMware Workstation Pro" in result.output
+
+
+def test_cli_plan_configured_p05():
+    """Verify cloudprac plan P05 outputs dry-run plan successfully."""
+    result = runner.invoke(app, ["plan", "P05"])
+    assert result.exit_code == 0
+    assert "Execution Plan: P05" in result.output
+    assert "s3:CreateBucket" in result.output
+    assert "dynamodb:CreateTable" in result.output
+    assert "ec2:RunInstances" in result.output
+
+
+def test_cli_plan_local_p01_blocks_safely():
+    """Verify cloudprac plan P01 safely informs student it is a local virtualization practical."""
+    result = runner.invoke(app, ["plan", "P01"])
+    assert result.exit_code == 1
+    assert "local virtualization practical" in result.output
+
 
 
 def test_cli_inspect_invalid():

@@ -64,8 +64,7 @@ def print_practicals_table(practicals: List[PracticalContract]) -> None:
 
     console.print(table)
     console.print(
-        "\n[dim]* Note: Modules P02–P08 remain in [yellow]NOT CONFIGURED[/yellow] status "
-        "until college practical instructions are provided.[/dim]\n"
+        "\n[dim]* Note: P01 is a local VMware/Ubuntu virtualization lab. Modules P02–P04 and P06–P08 remain in [yellow]NOT CONFIGURED[/yellow] status.[/dim]\n"
     )
 
 
