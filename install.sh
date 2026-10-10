@@ -32,7 +32,7 @@ fi
 
 # 2. Check Python 3.10+
 PYTHON_BIN=""
-for candidate in python3 python3.12 python3.11 python3.10; do
+for candidate in python3 python3.13 python3.12 python3.11 python3.10; do
     if command -v "$candidate" >/dev/null 2>&1; then
         if "$candidate" -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" 2>/dev/null; then
             PYTHON_BIN="$candidate"
@@ -61,16 +61,74 @@ if [ ! -f "${TARGET_DIR}/pyproject.toml" ]; then
     TARGET_DIR="$REPO_DIR"
 fi
 
-# 4. Install CloudPrac package
-echo -e "${DIM}Installing CloudPrac using ${PYTHON_BIN}...${RESET}"
-if ! "$PYTHON_BIN" -m pip --version >/dev/null 2>&1; then
-    echo -e "${DIM}Bootstrapping pip via ensurepip...${RESET}"
-    "$PYTHON_BIN" -m ensurepip --user 2>/dev/null || true
+# 4. Set up predictable, isolated installation environment
+CLOUDPRAC_HOME="${CLOUDPRAC_HOME:-${HOME}/.cloudprac}"
+VENV_DIR="${CLOUDPRAC_VENV:-${CLOUDPRAC_HOME}/venv}"
+LOCAL_BIN="${HOME}/.local/bin"
+
+mkdir -p "${CLOUDPRAC_HOME}" "${LOCAL_BIN}"
+
+# Detect if the selected Python is inside an existing virtual environment
+IN_VIRTUAL_ENV=false
+if [ -n "${VIRTUAL_ENV:-}" ]; then
+    IN_VIRTUAL_ENV=true
+elif "$PYTHON_BIN" -c "import sys; sys.exit(0 if (getattr(sys, 'base_prefix', sys.prefix) != sys.prefix or getattr(sys, 'real_prefix', None) is not None) else 1)" 2>/dev/null; then
+    IN_VIRTUAL_ENV=true
 fi
-"$PYTHON_BIN" -m pip install --user --upgrade --quiet --no-warn-script-location "$TARGET_DIR"
+
+USE_ISOLATED_VENV=true
+VENV_READY=false
+if [ -x "${VENV_DIR}/bin/python" ]; then
+    if "${VENV_DIR}/bin/python" -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" 2>/dev/null; then
+        VENV_READY=true
+    fi
+fi
+
+if [ "$VENV_READY" = "false" ]; then
+    echo -e "${DIM}Setting up isolated CloudPrac environment in ${VENV_DIR}...${RESET}"
+    rm -rf "${VENV_DIR}"
+    if ! "$PYTHON_BIN" -m venv "${VENV_DIR}" 2>/dev/null; then
+        if [ "$IN_VIRTUAL_ENV" = "true" ]; then
+            echo -e "${BOLD_RED}✘ Error: Python is inside a virtual environment and creating an isolated environment failed.${RESET}"
+            echo "Cannot perform a '--user' install inside a virtualenv, and installing into an unknown virtual environment is prohibited."
+            echo "Please ensure the python3-venv package is installed or run with a functional base Python."
+            exit 1
+        else
+            USE_ISOLATED_VENV=false
+        fi
+    fi
+fi
+
+if [ "$USE_ISOLATED_VENV" = "true" ]; then
+    # Ensure pip is present inside the isolated venv
+    if [ ! -x "${VENV_DIR}/bin/pip" ]; then
+        echo -e "${DIM}Bootstrapping pip in isolated environment...${RESET}"
+        "${VENV_DIR}/bin/python" -m ensurepip --default-pip 2>/dev/null || true
+    fi
+
+    echo -e "${DIM}Installing CloudPrac into isolated environment...${RESET}"
+    "${VENV_DIR}/bin/python" -m pip install --upgrade --quiet --no-warn-script-location "$TARGET_DIR"
+
+    # Expose the cloudprac executable in ~/.local/bin
+    if [ -f "${VENV_DIR}/bin/cloudprac" ]; then
+        rm -f "${LOCAL_BIN}/cloudprac"
+        ln -sf "${VENV_DIR}/bin/cloudprac" "${LOCAL_BIN}/cloudprac"
+        chmod +x "${LOCAL_BIN}/cloudprac"
+    else
+        echo -e "${BOLD_RED}✘ Error: ${VENV_DIR}/bin/cloudprac not found after installation.${RESET}"
+        exit 1
+    fi
+else
+    # Fallback to user install only when not in a virtual environment
+    echo -e "${DIM}Installing CloudPrac using ${PYTHON_BIN}...${RESET}"
+    if ! "$PYTHON_BIN" -m pip --version >/dev/null 2>&1; then
+        echo -e "${DIM}Bootstrapping pip via ensurepip...${RESET}"
+        "$PYTHON_BIN" -m ensurepip --user 2>/dev/null || true
+    fi
+    "$PYTHON_BIN" -m pip install --user --upgrade --quiet --no-warn-script-location "$TARGET_DIR"
+fi
 
 # 5. Ensure PATH includes ~/.local/bin
-LOCAL_BIN="${HOME}/.local/bin"
 if [[ ":$PATH:" != *":$LOCAL_BIN:"* ]]; then
     export PATH="${LOCAL_BIN}:${PATH}"
     if [ -f "${HOME}/.bashrc" ] && ! grep -q "export PATH=\"${LOCAL_BIN}:\$PATH\"" "${HOME}/.bashrc"; then
@@ -79,17 +137,18 @@ if [[ ":$PATH:" != *":$LOCAL_BIN:"* ]]; then
 fi
 
 # 6. Verify installation
-if ! command -v cloudprac >/dev/null 2>&1; then
-    CLOUDPRAC_BIN="${LOCAL_BIN}/cloudprac"
-    if [ -f "$CLOUDPRAC_BIN" ] || [ -x "$CLOUDPRAC_BIN" ]; then
-        CLOUDPRAC_CMD="$CLOUDPRAC_BIN"
-    else
-        echo -e "${BOLD_RED}✘ Error: cloudprac executable not found in PATH or ~/.local/bin.${RESET}"
-        exit 1
-    fi
-else
+CLOUDPRAC_BIN="${LOCAL_BIN}/cloudprac"
+if [ -f "$CLOUDPRAC_BIN" ] || [ -x "$CLOUDPRAC_BIN" ]; then
+    CLOUDPRAC_CMD="$CLOUDPRAC_BIN"
+elif command -v cloudprac >/dev/null 2>&1; then
     CLOUDPRAC_CMD="cloudprac"
+elif [ -x "${VENV_DIR}/bin/cloudprac" ]; then
+    CLOUDPRAC_CMD="${VENV_DIR}/bin/cloudprac"
+else
+    echo -e "${BOLD_RED}✘ Error: cloudprac executable not found in PATH or ~/.local/bin.${RESET}"
+    exit 1
 fi
+
 
 echo -e "${BOLD_GREEN}✔ CloudPrac successfully installed!${RESET}"
 echo ""
