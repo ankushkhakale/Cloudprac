@@ -1,10 +1,10 @@
 """Test fixtures and isolation setup for CloudPrac test suite."""
 
-import os
 import shutil
 import tempfile
 from pathlib import Path
 from typing import Generator
+
 import pytest
 
 from cloudprac.utils.paths import ENV_CLOUDPRAC_HOME

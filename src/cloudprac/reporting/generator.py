@@ -11,7 +11,6 @@ from cloudprac.core.models import (
     CleanupResult,
     ExecutionPlan,
     ExecutionResult,
-    RunManifest,
     VerificationResult,
 )
 from cloudprac.utils.config import CloudPracConfig
@@ -163,7 +162,7 @@ class ReportGenerator:
             del_count = len(cleanup_result.resources_deleted)
             fail_count = len(cleanup_result.resources_failed)
             md_lines.extend([
-                f"- **Cleanup Executed**: Yes",
+                "- **Cleanup Executed**: Yes",
                 f"- **Resources Deleted**: {del_count}",
                 f"- **Resources Failed**: {fail_count}",
             ])

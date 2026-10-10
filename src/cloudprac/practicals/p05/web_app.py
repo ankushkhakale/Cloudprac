@@ -4,10 +4,16 @@ Designed to run on the EC2 instance using ambient IAM instance profile credentia
 and also testable locally in offline unit test suites.
 """
 
+import logging
 import os
 import re
-from typing import Any, Dict, Optional
-from flask import Flask, jsonify, request, render_template_string, Response
+from typing import Any, Optional
+
+from flask import Flask, Response, jsonify, render_template_string, request
+
+logger = logging.getLogger(__name__)
+
+ALLOWED_EXTENSIONS = {".txt", ".pdf", ".csv", ".doc", ".docx", ".png", ".jpg", ".jpeg"}
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
@@ -55,6 +61,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <span class="badge">AWS CloudPrac P05</span>
         <h1>Student Record Management</h1>
         <p style="color: var(--muted);">Running on Amazon EC2 &bull; Records in Amazon DynamoDB &bull; Documents in Amazon S3</p>
+        <div style="margin-top: 1rem; max-width: 400px;">
+            <label>Admin Authentication Token</label>
+            <input type="password" id="auth_token" placeholder="Enter admin token from run directory">
+        </div>
     </header>
 
     <div class="grid">
@@ -111,6 +121,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 </div>
 
 <script>
+function getToken() {
+    return (document.getElementById('auth_token').value || '').trim();
+}
+
 async function loadStudents() {
     try {
         const res = await fetch('/api/students');
@@ -151,7 +165,10 @@ async function addStudent(e) {
     try {
         const resp = await fetch('/api/students', {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Admin-Token': getToken()
+            },
             body: JSON.stringify({ student_id: sid, name: name, course: course, email: email, year: year })
         });
         const data = await resp.json();
@@ -180,6 +197,9 @@ async function uploadDocument(e) {
     try {
         const resp = await fetch(`/api/students/${sid}/document`, {
             method: 'POST',
+            headers: {
+                'X-Admin-Token': getToken()
+            },
             body: formData
         });
         const data = await resp.json();
@@ -206,6 +226,7 @@ def create_app(
     table_name: Optional[str] = None,
     bucket_name: Optional[str] = None,
     boto_session: Optional[Any] = None,
+    admin_token: Optional[str] = None,
 ) -> Flask:
     """Create configured Flask application instance."""
     app = Flask(__name__)
@@ -214,6 +235,13 @@ def create_app(
     dynamo_table_name = table_name or os.environ.get("DYNAMODB_TABLE", "cloudprac-p05-students")
     s3_bucket_name = bucket_name or os.environ.get("S3_BUCKET", "cloudprac-p05-documents")
     region_name = os.environ.get("AWS_DEFAULT_REGION", os.environ.get("AWS_REGION", "us-east-1"))
+    auth_token = (admin_token or os.environ.get("ADMIN_TOKEN", "")).strip()
+
+    if not auth_token:
+        logger.warning(
+            "No ADMIN_TOKEN configured for student-record application. "
+            "Running in fail-closed mode: all mutating endpoints will return 401 Unauthorized."
+        )
 
     # Boto3 client initialization
     if boto_session is not None:
@@ -223,6 +251,26 @@ def create_app(
         import boto3
         dynamodb = boto3.client("dynamodb", region_name=region_name)
         s3 = boto3.client("s3", region_name=region_name)
+
+    def is_authorized() -> bool:
+        """Validate admin authentication for sensitive/mutating operations.
+
+        Fails closed if no auth_token is configured on the server.
+        Accepts credentials only via HTTP headers (X-Admin-Token or Bearer Authorization);
+        query-string token authentication is intentionally rejected to prevent URL logging.
+        """
+        if not auth_token:
+            return False
+        header_val = (request.headers.get("X-Admin-Token") or request.headers.get("Authorization", "")).strip()
+        if header_val.startswith("Bearer "):
+            header_val = header_val[7:].strip()
+        if not header_val:
+            return False
+        import hmac
+        return hmac.compare_digest(header_val, auth_token)
+
+    def is_valid_student_id(sid: str) -> bool:
+        return bool(re.match(r"^[a-zA-Z0-9_-]{1,64}$", sid))
 
     @app.route("/health", methods=["GET"])
     def health():
@@ -260,11 +308,15 @@ def create_app(
                 records.append(record)
             return jsonify({"students": records, "count": len(records)}), 200
         except Exception as e:
-            return jsonify({"error": f"Failed to list students: {str(e)}"}), 500
+            logger.error("DynamoDB scan failed: %s", e)
+            return jsonify({"error": "Failed to list students. Database query failed."}), 500
 
     @app.route("/api/students", methods=["POST"])
     def add_student():
         """Add a new student record to DynamoDB."""
+        if not is_authorized():
+            return jsonify({"error": "Unauthorized: valid X-Admin-Token header or ?token required."}), 401
+
         data = request.get_json(silent=True)
         if not data or not isinstance(data, dict):
             return jsonify({"error": "Invalid JSON body provided."}), 400
@@ -280,9 +332,8 @@ def create_app(
         if not course:
             return jsonify({"error": "Field 'course' is required."}), 400
 
-        # Safe input sanitization
-        if not re.match(r"^[a-zA-Z0-9_-]+$", student_id):
-            return jsonify({"error": "Field 'student_id' must contain only alphanumeric, dash, or underscore characters."}), 400
+        if not is_valid_student_id(student_id):
+            return jsonify({"error": "Field 'student_id' must contain 1-64 alphanumeric, dash, or underscore characters."}), 400
 
         item = {
             "student_id": {"S": student_id},
@@ -301,11 +352,15 @@ def create_app(
             )
             return jsonify({"message": f"Student '{student_id}' created successfully.", "student_id": student_id}), 201
         except Exception as e:
-            return jsonify({"error": f"DynamoDB operation failed: {str(e)}"}), 500
+            logger.error("DynamoDB put_item failed: %s", e)
+            return jsonify({"error": "Failed to create student. Database write failed."}), 500
 
     @app.route("/api/students/<student_id>", methods=["GET"])
     def get_student(student_id: str):
         """Retrieve a specific student record from DynamoDB."""
+        if not is_valid_student_id(student_id):
+            return jsonify({"error": "Invalid student_id format."}), 400
+
         try:
             resp = dynamodb.get_item(
                 TableName=dynamo_table_name,
@@ -326,11 +381,18 @@ def create_app(
                     record[k] = str(v)
             return jsonify(record), 200
         except Exception as e:
-            return jsonify({"error": f"Failed to retrieve student: {str(e)}"}), 500
+            logger.error("DynamoDB get_item failed: %s", e)
+            return jsonify({"error": "Failed to retrieve student record."}), 500
 
     @app.route("/api/students/<student_id>", methods=["PUT"])
     def update_student(student_id: str):
         """Update fields for an existing student record."""
+        if not is_authorized():
+            return jsonify({"error": "Unauthorized: valid X-Admin-Token header or ?token required."}), 401
+
+        if not is_valid_student_id(student_id):
+            return jsonify({"error": "Invalid student_id format."}), 400
+
         data = request.get_json(silent=True)
         if not data or not isinstance(data, dict):
             return jsonify({"error": "Invalid JSON body provided."}), 400
@@ -368,11 +430,18 @@ def create_app(
                 record[k] = v.get("S", v.get("N", str(v)))
             return jsonify({"message": f"Student '{student_id}' updated.", "record": record}), 200
         except Exception as e:
-            return jsonify({"error": f"Failed to update student: {str(e)}"}), 500
+            logger.error("DynamoDB update_item failed: %s", e)
+            return jsonify({"error": "Failed to update student record."}), 500
 
     @app.route("/api/students/<student_id>", methods=["DELETE"])
     def delete_student(student_id: str):
         """Delete a student record from DynamoDB."""
+        if not is_authorized():
+            return jsonify({"error": "Unauthorized: valid X-Admin-Token header or ?token required."}), 401
+
+        if not is_valid_student_id(student_id):
+            return jsonify({"error": "Invalid student_id format."}), 400
+
         try:
             dynamodb.delete_item(
                 TableName=dynamo_table_name,
@@ -380,13 +449,19 @@ def create_app(
             )
             return jsonify({"message": f"Student '{student_id}' deleted successfully."}), 200
         except Exception as e:
-            return jsonify({"error": f"Failed to delete student: {str(e)}"}), 500
+            logger.error("DynamoDB delete_item failed: %s", e)
+            return jsonify({"error": "Failed to delete student record."}), 500
 
     @app.route("/api/students/<student_id>/document", methods=["POST"])
     def upload_document(student_id: str):
         """Upload a student document to private S3 and link to DynamoDB record."""
+        if not is_authorized():
+            return jsonify({"error": "Unauthorized: valid X-Admin-Token header or ?token required."}), 401
+
+        if not is_valid_student_id(student_id):
+            return jsonify({"error": "Invalid student_id format."}), 400
+
         if "document" not in request.files:
-            # Check if JSON content was supplied
             raw_text = request.form.get("text")
             if raw_text:
                 file_bytes = raw_text.encode("utf-8")
@@ -404,6 +479,10 @@ def create_app(
 
         if len(file_bytes) > 5 * 1024 * 1024:
             return jsonify({"error": "Document size exceeds 5 MB limit."}), 413
+
+        _, ext = os.path.splitext(filename)
+        if ext.lower() not in ALLOWED_EXTENSIONS:
+            return jsonify({"error": f"Unsupported file extension '{ext}'. Allowed extensions: {', '.join(sorted(ALLOWED_EXTENSIONS))}"}), 400
 
         safe_filename = re.sub(r"[^a-zA-Z0-9_.-]", "_", filename)
         object_key = f"documents/{student_id}-{safe_filename}"
@@ -433,11 +512,15 @@ def create_app(
                 "size_bytes": len(file_bytes),
             }), 201
         except Exception as e:
-            return jsonify({"error": f"Failed to store document: {str(e)}"}), 500
+            logger.error("S3/DynamoDB document upload failed: %s", e)
+            return jsonify({"error": "Failed to store document in cloud storage."}), 500
 
     @app.route("/api/students/<student_id>/document", methods=["GET"])
     def download_document(student_id: str):
         """Retrieve a student document from private S3 safely."""
+        if not is_valid_student_id(student_id):
+            return jsonify({"error": "Invalid student_id format."}), 400
+
         try:
             # 1. Look up student record to get document_key
             resp = dynamodb.get_item(
@@ -450,6 +533,10 @@ def create_app(
 
             doc_key = raw["document_key"]["S"]
 
+            # Prevent directory traversal
+            if not doc_key.startswith("documents/") or ".." in doc_key:
+                return jsonify({"error": "Invalid document key referenced."}), 400
+
             # 2. Fetch object from S3
             s3_obj = s3.get_object(Bucket=s3_bucket_name, Key=doc_key)
             content = s3_obj["Body"].read()
@@ -461,6 +548,7 @@ def create_app(
                 headers={"Content-Disposition": f"inline; filename={os.path.basename(doc_key)}"},
             )
         except Exception as e:
-            return jsonify({"error": f"Failed to retrieve document: {str(e)}"}), 500
+            logger.error("Failed to retrieve document: %s", e)
+            return jsonify({"error": "Failed to retrieve document from cloud storage."}), 500
 
     return app

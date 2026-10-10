@@ -1,7 +1,6 @@
 """Guarded cleanup engine for restoring AWS environment after practical run."""
 
 import json
-from pathlib import Path
 from typing import Any, Optional
 
 from cloudprac.core.contract import PracticalContract, PracticalNotConfiguredError

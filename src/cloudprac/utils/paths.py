@@ -44,3 +44,19 @@ def ensure_cloudprac_dirs() -> None:
     get_cloudprac_home().mkdir(parents=True, exist_ok=True)
     get_logs_dir().mkdir(parents=True, exist_ok=True)
     get_runs_dir().mkdir(parents=True, exist_ok=True)
+
+
+def save_restricted_file(file_path: Path, content: str) -> Path:
+    """Save content to a local file with permissions restricted strictly to the current user (0600)."""
+    import stat
+
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        fd = os.open(str(file_path), flags, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.chmod(str(file_path), stat.S_IRUSR | stat.S_IWUSR)
+    else:
+        file_path.write_text(content, encoding="utf-8")
+    return file_path

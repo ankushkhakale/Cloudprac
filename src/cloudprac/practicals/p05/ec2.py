@@ -1,24 +1,46 @@
 """EC2 provisioning, user-data bootstrap, verification, and cleanup for Practical 05."""
 
 import base64
-import os
-import platform
-import stat
+import ipaddress
 import time
-import urllib.request
 import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
 from botocore.exceptions import ClientError
 
 from cloudprac.core.models import (
-    TrackedResource,
     VerificationCheck,
 )
 from cloudprac.utils.logging import get_logger
-from cloudprac.utils.paths import get_cloudprac_home
+from cloudprac.utils.paths import get_cloudprac_home, save_restricted_file
 
 logger = get_logger()
+
+
+def validate_cidr_block(cidr: Optional[str], param_name: str = "app_cidr") -> str:
+    """Validate that CIDR is an explicit, restricted IPv4 block.
+
+    Rejects unspecified (None/empty) or broad (/0) CIDRs such as 0.0.0.0/0 to protect student records.
+    """
+    if not cidr or not cidr.strip():
+        raise ValueError(
+            f"An explicit restricted IPv4 CIDR is required for {param_name} "
+            "(e.g., --app-cidr <your-ip>/32 or your VPC CIDR). An unspecified CIDR is prohibited to protect student records."
+        )
+    cleaned = cidr.strip()
+    try:
+        net = ipaddress.ip_network(cleaned, strict=False)
+    except ValueError as e:
+        raise ValueError(f"Invalid IPv4 CIDR format for {param_name} ('{cleaned}'): {e}") from e
+
+    if net.prefixlen == 0 or cleaned in ("0.0.0.0/0", "::/0"):
+        raise ValueError(
+            f"Opening application port to the public internet ('{cleaned}') is prohibited "
+            "to protect student records. Specify an explicit restricted CIDR (e.g. --app-cidr <your-ip>/32)."
+        )
+    return cleaned
 
 
 def get_default_or_first_vpc(ec2_client: Any) -> Tuple[str, str]:
@@ -101,7 +123,7 @@ def setup_key_pair(
     local_key_file = keys_dir / f"{key_name}.pem"
 
     try:
-        resp = ec2_client.describe_key_pairs(KeyNames=[key_name])
+        ec2_client.describe_key_pairs(KeyNames=[key_name])
         logger.info(f"Using existing EC2 Key Pair '{key_name}'.")
         return key_name, local_key_file if local_key_file.exists() else None
     except ClientError as e:
@@ -117,9 +139,7 @@ def setup_key_pair(
     key_material = create_resp.get("KeyMaterial", "")
 
     if save_local_file and key_material:
-        local_key_file.write_text(key_material, encoding="utf-8")
-        if platform.system() != "Windows":
-            os.chmod(local_key_file, stat.S_IRUSR | stat.S_IWUSR)
+        save_restricted_file(local_key_file, key_material)
         logger.info(f"Saved private key to '{local_key_file}' (permissions: 0600).")
         return key_name, local_key_file
 
@@ -162,8 +182,8 @@ def setup_security_group(
             raise
 
     # Ingress rule for Application port (e.g. 5000)
-    # Default to 0.0.0.0/0 only if app_cidr is not specified or set, allowing student testing
-    target_app_cidr = app_cidr or "0.0.0.0/0"
+    # Strictly require explicit, restricted CIDR; broad 0.0.0.0/0 is prohibited
+    target_app_cidr = validate_cidr_block(app_cidr, "app_cidr")
     try:
         ec2_client.authorize_security_group_ingress(
             GroupId=sg_id,
@@ -180,8 +200,9 @@ def setup_security_group(
         if e.response.get("Error", {}).get("Code") != "InvalidPermission.Duplicate":
             raise
 
-    # Inbound SSH rule (Only if explicit CIDR is provided; never open SSH by default)
+    # Inbound SSH rule (Only if explicit restricted CIDR is provided; never open SSH by default)
     if ssh_cidr:
+        target_ssh_cidr = validate_cidr_block(ssh_cidr, "ssh_cidr")
         try:
             ec2_client.authorize_security_group_ingress(
                 GroupId=sg_id,
@@ -190,7 +211,7 @@ def setup_security_group(
                         "IpProtocol": "tcp",
                         "FromPort": 22,
                         "ToPort": 22,
-                        "IpRanges": [{"CidrIp": ssh_cidr, "Description": "CloudPrac SSH Access"}],
+                        "IpRanges": [{"CidrIp": target_ssh_cidr, "Description": "CloudPrac SSH Access"}],
                     }
                 ],
             )
@@ -206,11 +227,31 @@ def build_user_data_script(
     bucket_name: str,
     region: str,
     app_port: int = 5000,
+    token_s3_key: Optional[str] = None,
+    admin_token: Optional[str] = None,
 ) -> str:
     """Generate shell user-data script to bootstrap the student-record Flask app on AL2023.
 
-    Keeps the bootstrap script comfortably under the AWS 16 KB / 25600-byte user-data limit.
+    Security & Secret Delivery:
+    Plaintext admin tokens MUST NEVER be embedded directly into EC2 user-data, bootstrap scripts,
+    or console logs (user-data is exposed via IMDS and describe-instance-attribute).
+    Instead, the token is delivered via a private S3 object and fetched at runtime using the
+    EC2 instance's attached IAM role credentials, writing to /opt/cloudprac/.env (mode 0600).
+    Fails closed if a valid token_s3_key is missing or if plaintext token embedding is attempted.
     """
+    if admin_token is not None:
+        raise ValueError(
+            "Embedding admin_token directly in user-data is prohibited to prevent secret leakage. "
+            "Use token_s3_key to deliver credentials securely via private S3."
+        )
+
+    clean_s3_key = (token_s3_key or "").strip()
+    if not clean_s3_key:
+        raise ValueError(
+            "A secure secret delivery path (token_s3_key) is required to bootstrap the EC2 application. "
+            "Failing closed to prevent insecure unauthenticated deployment."
+        )
+
     compact_app = f'''import os, re, boto3
 from flask import Flask, jsonify, request, Response
 
@@ -218,46 +259,69 @@ app = Flask(__name__)
 table_name = os.environ.get("DYNAMODB_TABLE", "{table_name}")
 bucket_name = os.environ.get("S3_BUCKET", "{bucket_name}")
 region = os.environ.get("AWS_DEFAULT_REGION", "{region}")
+admin_token = os.environ.get("ADMIN_TOKEN", "").strip()
 dynamodb = boto3.client("dynamodb", region_name=region)
 s3 = boto3.client("s3", region_name=region)
+ALLOWED_EXTS = {{".txt", ".pdf", ".csv", ".doc", ".docx", ".png", ".jpg", ".jpeg"}}
+
+def auth_ok():
+    if not admin_token: return False
+    h = request.headers.get("X-Admin-Token", "").strip() or request.headers.get("Authorization", "").strip()
+    if h.startswith("Bearer "): h = h[7:].strip()
+    return bool(h and h == admin_token)
+
+def valid_sid(s): return bool(re.match(r"^[a-zA-Z0-9_-]{{1,64}}$", s))
 
 @app.route("/health")
 def health():
-    return jsonify({{"status": "healthy", "table": table_name, "bucket": bucket_name, "practical": "P05"}}), 200
+    return jsonify({{"status": "healthy", "practical": "P05", "service": "student-record-manager", "table": table_name, "bucket": bucket_name, "region": region}}), 200
 
 @app.route("/")
 def home():
-    return "<h1>CloudPrac P05 Student Record Management</h1><p>Operational on Amazon EC2</p>"
+    return "<h1>CloudPrac P05 Student Record Management</h1><p>Operational on Amazon EC2 (Protected by token auth and restricted security group)</p>"
 
 @app.route("/api/students", methods=["GET"])
 def list_students():
-    resp = dynamodb.scan(TableName=table_name)
-    items = [{{k: v.get("S", v.get("N", str(v))) for k, v in item.items()}} for item in resp.get("Items", [])]
-    return jsonify({{"students": items, "count": len(items)}}), 200
+    try:
+        resp = dynamodb.scan(TableName=table_name)
+        items = [{{k: v.get("S", v.get("N", str(v))) for k, v in item.items()}} for item in resp.get("Items", [])]
+        return jsonify({{"students": items, "count": len(items)}}), 200
+    except Exception:
+        return jsonify({{"error": "Database query failed"}}), 500
 
 @app.route("/api/students", methods=["POST"])
 def add_student():
+    if not auth_ok(): return jsonify({{"error": "Unauthorized. Provide valid X-Admin-Token header"}}), 401
     data = request.get_json(silent=True) or {{}}
     sid = str(data.get("student_id", "")).strip()
     name = str(data.get("name", "")).strip()
     course = str(data.get("course", "")).strip()
-    if not sid or not name or not course:
-        return jsonify({{"error": "student_id, name, and course required"}}), 400
+    if not sid or not name or not course: return jsonify({{"error": "student_id, name, and course required"}}), 400
+    if not valid_sid(sid): return jsonify({{"error": "Invalid student_id format"}}), 400
     item = {{"student_id": {{"S": sid}}, "name": {{"S": name}}, "course": {{"S": course}}}}
     for f in ["email", "year", "document_key"]:
         if data.get(f): item[f] = {{"S": str(data[f])}}
-    dynamodb.put_item(TableName=table_name, Item=item)
-    return jsonify({{"message": f"Student {{sid}} created", "student_id": sid}}), 201
+    try:
+        dynamodb.put_item(TableName=table_name, Item=item)
+        return jsonify({{"message": f"Student {{sid}} created", "student_id": sid}}), 201
+    except Exception:
+        return jsonify({{"error": "Failed to create student"}}), 500
 
 @app.route("/api/students/<sid>", methods=["GET"])
 def get_student(sid):
-    resp = dynamodb.get_item(TableName=table_name, Key={{"student_id": {{"S": sid}}}}, ConsistentRead=True)
-    item = resp.get("Item")
-    if not item: return jsonify({{"error": "Not found"}}), 404
-    return jsonify({{k: v.get("S", v.get("N", str(v))) for k, v in item.items()}}), 200
+    if not valid_sid(sid): return jsonify({{"error": "Invalid student_id format"}}), 400
+    try:
+        resp = dynamodb.get_item(TableName=table_name, Key={{"student_id": {{"S": sid}}}}, ConsistentRead=True)
+        item = resp.get("Item")
+        if not item: return jsonify({{"error": "Not found"}}), 404
+        return jsonify({{k: v.get("S", v.get("N", str(v))) for k, v in item.items()}}), 200
+    except Exception:
+        return jsonify({{"error": "Database lookup failed"}}), 500
 
 @app.route("/api/students/<sid>", methods=["PUT"])
 def update_student(sid):
+    if not auth_ok(): return jsonify({{"error": "Unauthorized. Provide valid X-Admin-Token header"}}), 401
+    if not valid_sid(sid): return jsonify({{"error": "Invalid student_id format"}}), 400
     data = request.get_json(silent=True) or {{}}
     parts, names, vals = [], {{}}, {{}}
     for i, f in enumerate(["name", "course", "email", "year", "document_key"]):
@@ -266,32 +330,54 @@ def update_student(sid):
             names[f"#f{{i}}"] = f
             vals[f":v{{i}}"] = {{"S": str(data[f])}}
     if not parts: return jsonify({{"error": "No update fields"}}), 400
-    dynamodb.update_item(TableName=table_name, Key={{"student_id": {{"S": sid}}}},
-        UpdateExpression="SET " + ", ".join(parts), ExpressionAttributeNames=names, ExpressionAttributeValues=vals)
-    return jsonify({{"message": f"Student {{sid}} updated"}}), 200
+    try:
+        dynamodb.update_item(TableName=table_name, Key={{"student_id": {{"S": sid}}}},
+            UpdateExpression="SET " + ", ".join(parts), ExpressionAttributeNames=names, ExpressionAttributeValues=vals)
+        return jsonify({{"message": f"Student {{sid}} updated"}}), 200
+    except Exception:
+        return jsonify({{"error": "Update failed"}}), 500
 
 @app.route("/api/students/<sid>", methods=["DELETE"])
 def delete_student(sid):
-    dynamodb.delete_item(TableName=table_name, Key={{"student_id": {{"S": sid}}}})
-    return jsonify({{"message": f"Student {{sid}} deleted"}}), 200
+    if not auth_ok(): return jsonify({{"error": "Unauthorized. Provide valid X-Admin-Token header"}}), 401
+    if not valid_sid(sid): return jsonify({{"error": "Invalid student_id format"}}), 400
+    try:
+        dynamodb.delete_item(TableName=table_name, Key={{"student_id": {{"S": sid}}}})
+        return jsonify({{"message": f"Student {{sid}} deleted"}}), 200
+    except Exception:
+        return jsonify({{"error": "Delete failed"}}), 500
 
 @app.route("/api/students/<sid>/document", methods=["POST"])
 def upload_doc(sid):
+    if not auth_ok(): return jsonify({{"error": "Unauthorized. Provide valid X-Admin-Token header"}}), 401
+    if not valid_sid(sid): return jsonify({{"error": "Invalid student_id format"}}), 400
     if "document" not in request.files: return jsonify({{"error": "No document"}}), 400
     f = request.files["document"]
-    key = f"documents/{{sid}}-{{re.sub(r'[^a-zA-Z0-9_.-]', '_', f.filename)}}"
-    s3.put_object(Bucket=bucket_name, Key=key, Body=f.read(), ContentType=f.content_type or "text/plain")
-    dynamodb.update_item(TableName=table_name, Key={{"student_id": {{"S": sid}}}},
-        UpdateExpression="SET #dk = :dk", ExpressionAttributeNames={{"#dk": "document_key"}}, ExpressionAttributeValues={{":dk": {{"S": key}}}})
-    return jsonify({{"message": "Uploaded", "key": key}}), 201
+    fname = f.filename or ""
+    ext = os.path.splitext(fname)[1].lower()
+    if ext not in ALLOWED_EXTS: return jsonify({{"error": "Unsupported file extension"}}), 400
+    key = f"documents/{{sid}}-{{re.sub(r'[^a-zA-Z0-9_.-]', '_', fname)}}"
+    try:
+        body = f.read()
+        if len(body) > 5 * 1024 * 1024: return jsonify({{"error": "File exceeds 5MB"}}), 413
+        s3.put_object(Bucket=bucket_name, Key=key, Body=body, ContentType=f.content_type or "application/octet-stream")
+        dynamodb.update_item(TableName=table_name, Key={{"student_id": {{"S": sid}}}},
+            UpdateExpression="SET #dk = :dk", ExpressionAttributeNames={{"#dk": "document_key"}}, ExpressionAttributeValues={{":dk": {{"S": key}}}})
+        return jsonify({{"message": "Uploaded", "key": key}}), 201
+    except Exception:
+        return jsonify({{"error": "Upload failed"}}), 500
 
 @app.route("/api/students/<sid>/document", methods=["GET"])
 def download_doc(sid):
-    resp = dynamodb.get_item(TableName=table_name, Key={{"student_id": {{"S": sid}}}})
-    key = resp.get("Item", {{}}).get("document_key", {{}}).get("S")
-    if not key: return jsonify({{"error": "No document"}}), 404
-    obj = s3.get_object(Bucket=bucket_name, Key=key)
-    return Response(obj["Body"].read(), mimetype=obj.get("ContentType", "text/plain"))
+    if not valid_sid(sid): return jsonify({{"error": "Invalid student_id format"}}), 400
+    try:
+        resp = dynamodb.get_item(TableName=table_name, Key={{"student_id": {{"S": sid}}}})
+        key = resp.get("Item", {{}}).get("document_key", {{}}).get("S")
+        if not key or not key.startswith("documents/") or ".." in key: return jsonify({{"error": "No document"}}), 404
+        obj = s3.get_object(Bucket=bucket_name, Key=key)
+        return Response(obj["Body"].read(), mimetype=obj.get("ContentType", "application/octet-stream"))
+    except Exception:
+        return jsonify({{"error": "Download failed"}}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port={app_port})
@@ -317,10 +403,37 @@ pip3 install flask boto3 gunicorn
 mkdir -p /opt/cloudprac
 cd /opt/cloudprac
 
-# 4. Write application code
+# 4. Securely fetch admin token from private S3 bucket using EC2 IAM Role credentials
+# The admin token is NEVER embedded into user-data, bootstrap scripts, or console logs.
+/usr/bin/python3 - <<'PYEOF'
+import boto3, os, sys
+try:
+    s3 = boto3.client("s3", region_name="{region}")
+    resp = s3.get_object(Bucket="{bucket_name}", Key="{clean_s3_key}")
+    token = resp["Body"].read().decode("utf-8").strip()
+    if not token or len(token) < 16:
+        print("ERROR: Fetched admin token is empty or invalid. Failing closed.", file=sys.stderr)
+        sys.exit(1)
+    with open("/opt/cloudprac/.env", "w") as f:
+        f.write(f"ADMIN_TOKEN={{token}}\\n")
+    os.chmod("/opt/cloudprac/.env", 0o600)
+    print("Successfully retrieved admin token via IAM role credentials into /opt/cloudprac/.env (mode 0600)")
+except Exception as e:
+    print(f"FATAL: Failed to retrieve admin token from S3 via instance IAM role: {{e}}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+
+# Fail closed if .env was not created or is empty
+if [ ! -f /opt/cloudprac/.env ] || [ ! -s /opt/cloudprac/.env ]; then
+    echo "ERROR: /opt/cloudprac/.env missing or empty after token fetch. Halting bootstrap."
+    exit 1
+fi
+chmod 600 /opt/cloudprac/.env
+
+# 5. Write application code
 echo "{encoded_app_code}" | base64 -d > /opt/cloudprac/app.py
 
-# 5. Create systemd service
+# 6. Create systemd service
 cat <<'EOF' > /etc/systemd/system/cloudprac-app.service
 [Unit]
 Description=CloudPrac P05 Student Record Web Application
@@ -330,10 +443,11 @@ After=network.target
 Type=simple
 User=root
 WorkingDirectory=/opt/cloudprac
+EnvironmentFile=/opt/cloudprac/.env
 Environment=DYNAMODB_TABLE={table_name}
 Environment=S3_BUCKET={bucket_name}
 Environment=AWS_DEFAULT_REGION={region}
-ExecStart=/usr/local/bin/gunicorn -w 2 -b 0.0.0.0:{app_port} app:app
+ExecStart=/usr/bin/python3 -m gunicorn -w 2 -b 0.0.0.0:{app_port} app:app
 Restart=always
 RestartSec=5
 
@@ -341,7 +455,7 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 
-# 6. Enable and start systemd service
+# 7. Enable and start systemd service
 systemctl daemon-reload
 systemctl enable cloudprac-app.service
 systemctl start cloudprac-app.service
@@ -559,53 +673,176 @@ def cleanup_ec2_resources(
     instance_id: Optional[str] = None,
     security_group_id: Optional[str] = None,
     key_name: Optional[str] = None,
+    expected_run_id: Optional[str] = None,
 ) -> List[str]:
-    """Terminate EC2 instance, delete security group, and delete key pair cleanly."""
+    """Terminate EC2 instance, delete security group, and delete key pair cleanly.
+
+    Enforces ownership validation against expected_run_id and handles already-deleted resources idempotently.
+    """
     deleted: List[str] = []
 
     # 1. Terminate Instance
     if instance_id:
         try:
-            logger.info(f"Terminating EC2 instance '{instance_id}'...")
-            ec2_client.terminate_instances(InstanceIds=[instance_id])
-            deleted.append(f"ec2-instance:{instance_id}")
+            should_terminate = True
+            if expected_run_id:
+                try:
+                    desc = ec2_client.describe_instances(InstanceIds=[instance_id])
+                    resvs = desc.get("Reservations", [])
+                    if resvs and resvs[0].get("Instances"):
+                        inst = resvs[0]["Instances"][0]
+                        st = inst.get("State", {}).get("Name")
+                        if st == "terminated":
+                            logger.info(f"EC2 instance '{instance_id}' is already terminated.")
+                            deleted.append(f"ec2-instance:{instance_id}")
+                            should_terminate = False
+                        else:
+                            tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
+                            is_owned = tags.get("ManagedBy") == "CloudPrac" and tags.get("RunId") == expected_run_id
+                            if not is_owned:
+                                logger.error(
+                                    f"Ownership check failed for EC2 instance '{instance_id}': "
+                                    f"Tags {tags} do not verify ownership (expected ManagedBy=CloudPrac, RunId={expected_run_id}). "
+                                    "Skipping termination to prevent accidental destruction."
+                                )
+                                should_terminate = False
+                    else:
+                        should_terminate = False
+                except ClientError as e:
+                    if e.response.get("Error", {}).get("Code") in ("InvalidInstanceID.NotFound", "InvalidInstanceID.Malformed"):
+                        logger.info(f"EC2 instance '{instance_id}' not found. Already cleaned up.")
+                        should_terminate = False
+                    else:
+                        logger.error(
+                            f"Ownership check failed for EC2 instance '{instance_id}': {e}. "
+                            "Skipping termination to prevent accidental destruction."
+                        )
+                        should_terminate = False
+                except Exception as e:
+                    logger.error(
+                        f"Unexpected error inspecting tags on EC2 instance '{instance_id}': {e}. "
+                        "Skipping termination to prevent accidental destruction."
+                    )
+                    should_terminate = False
 
-            # Wait briefly for termination to avoid SG dependency block
-            logger.info(f"Waiting for instance '{instance_id}' to terminate...")
-            for _ in range(30):
-                time.sleep(4)
-                desc = ec2_client.describe_instances(InstanceIds=[instance_id])
-                state = desc["Reservations"][0]["Instances"][0]["State"]["Name"]
-                if state in ("terminated", "shutting-down"):
-                    break
+            if should_terminate:
+                logger.info(f"Terminating EC2 instance '{instance_id}'...")
+                ec2_client.terminate_instances(InstanceIds=[instance_id])
+                deleted.append(f"ec2-instance:{instance_id}")
+
+                # Wait briefly for termination to avoid SG dependency block
+                logger.info(f"Waiting for instance '{instance_id}' to terminate...")
+                for _ in range(30):
+                    time.sleep(4)
+                    desc = ec2_client.describe_instances(InstanceIds=[instance_id])
+                    state = desc["Reservations"][0]["Instances"][0]["State"]["Name"]
+                    if state in ("terminated", "shutting-down"):
+                        break
         except ClientError as e:
-            logger.warning(f"Could not terminate instance '{instance_id}': {e}")
+            if e.response.get("Error", {}).get("Code") != "InvalidInstanceID.NotFound":
+                logger.warning(f"Could not terminate instance '{instance_id}': {e}")
 
     # 2. Delete Security Group
     if security_group_id:
         try:
-            logger.info(f"Deleting security group '{security_group_id}'...")
-            # Retry a few times in case instance ENI detach is delayed
-            for attempt in range(5):
+            should_delete_sg = True
+            if expected_run_id:
                 try:
-                    ec2_client.delete_security_group(GroupId=security_group_id)
-                    deleted.append(f"security-group:{security_group_id}")
-                    break
+                    sg_desc = ec2_client.describe_security_groups(GroupIds=[security_group_id])
+                    sgs = sg_desc.get("SecurityGroups", [])
+                    if sgs:
+                        tags = {t["Key"]: t["Value"] for t in sgs[0].get("Tags", [])}
+                        is_owned = tags.get("ManagedBy") == "CloudPrac" and tags.get("RunId") == expected_run_id
+                        if not is_owned:
+                            logger.error(
+                                f"Ownership check failed for Security Group '{security_group_id}': "
+                                f"Tags {tags} do not verify ownership (expected ManagedBy=CloudPrac, RunId={expected_run_id}). "
+                                "Skipping deletion to prevent accidental destruction."
+                            )
+                            should_delete_sg = False
+                    else:
+                        should_delete_sg = False
                 except ClientError as e:
-                    if "DependencyViolation" in str(e) and attempt < 4:
-                        time.sleep(5)
-                        continue
-                    raise
+                    if e.response.get("Error", {}).get("Code") in ("InvalidGroup.NotFound", "InvalidGroupId.Malformed"):
+                        logger.info(f"Security group '{security_group_id}' not found. Already cleaned up.")
+                        should_delete_sg = False
+                    else:
+                        logger.error(
+                            f"Ownership check failed for Security Group '{security_group_id}': {e}. "
+                            "Skipping deletion to prevent accidental destruction."
+                        )
+                        should_delete_sg = False
+                except Exception as e:
+                    logger.error(
+                        f"Unexpected error inspecting tags on Security Group '{security_group_id}': {e}. "
+                        "Skipping deletion to prevent accidental destruction."
+                    )
+                    should_delete_sg = False
+
+            if should_delete_sg:
+                logger.info(f"Deleting security group '{security_group_id}'...")
+                # Retry a few times in case instance ENI detach is delayed
+                for attempt in range(6):
+                    try:
+                        ec2_client.delete_security_group(GroupId=security_group_id)
+                        deleted.append(f"security-group:{security_group_id}")
+                        break
+                    except ClientError as e:
+                        err_code = e.response.get("Error", {}).get("Code")
+                        if err_code in ("InvalidGroup.NotFound", "InvalidGroupId.Malformed"):
+                            logger.info(f"Security group '{security_group_id}' already gone.")
+                            break
+                        if "DependencyViolation" in str(e) and attempt < 5:
+                            time.sleep(5)
+                            continue
+                        raise
         except ClientError as e:
-            logger.warning(f"Could not delete security group '{security_group_id}': {e}")
+            if e.response.get("Error", {}).get("Code") != "InvalidGroup.NotFound":
+                logger.warning(f"Could not delete security group '{security_group_id}': {e}")
 
     # 3. Delete Key Pair registration (Preserves local file if exists)
     if key_name:
         try:
-            logger.info(f"Deleting EC2 Key Pair registration '{key_name}'...")
-            ec2_client.delete_key_pair(KeyName=key_name)
-            deleted.append(f"key-pair:{key_name}")
+            should_delete_kp = True
+            if expected_run_id:
+                try:
+                    kp_desc = ec2_client.describe_key_pairs(KeyNames=[key_name], IncludePublicKey=False)
+                    kps = kp_desc.get("KeyPairs", [])
+                    if kps:
+                        tags = {t["Key"]: t["Value"] for t in kps[0].get("Tags", [])}
+                        is_owned = tags.get("ManagedBy") == "CloudPrac" and tags.get("RunId") == expected_run_id
+                        if not is_owned:
+                            logger.error(
+                                f"Ownership check failed for Key Pair '{key_name}': "
+                                f"Tags {tags} do not verify ownership (expected ManagedBy=CloudPrac, RunId={expected_run_id}). "
+                                "Skipping deletion to prevent accidental destruction."
+                            )
+                            should_delete_kp = False
+                    else:
+                        should_delete_kp = False
+                except ClientError as e:
+                    if e.response.get("Error", {}).get("Code") in ("InvalidKeyPair.NotFound", "InvalidKeyPair.Duplicate"):
+                        logger.info(f"Key pair '{key_name}' not found. Already cleaned up.")
+                        should_delete_kp = False
+                    else:
+                        logger.error(
+                            f"Ownership check failed for Key Pair '{key_name}': {e}. "
+                            "Skipping deletion to prevent accidental destruction."
+                        )
+                        should_delete_kp = False
+                except Exception as e:
+                    logger.error(
+                        f"Unexpected error inspecting tags on Key Pair '{key_name}': {e}. "
+                        "Skipping deletion to prevent accidental destruction."
+                    )
+                    should_delete_kp = False
+
+            if should_delete_kp:
+                logger.info(f"Deleting EC2 Key Pair registration '{key_name}'...")
+                ec2_client.delete_key_pair(KeyName=key_name)
+                deleted.append(f"key-pair:{key_name}")
         except ClientError as e:
-            logger.warning(f"Could not delete key pair '{key_name}': {e}")
+            if e.response.get("Error", {}).get("Code") != "InvalidKeyPair.NotFound":
+                logger.warning(f"Could not delete key pair '{key_name}': {e}")
 
     return deleted

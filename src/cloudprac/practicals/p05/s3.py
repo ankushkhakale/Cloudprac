@@ -1,8 +1,10 @@
 """Amazon S3 bucket provisioning, document management, verification, and cleanup for Practical 05."""
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
 from botocore.exceptions import ClientError
 
 from cloudprac.core.models import VerificationCheck
@@ -31,7 +33,7 @@ def create_private_bucket(
     region: str,
     tags: Optional[Dict[str, str]] = None,
 ) -> str:
-    """Create a private S3 bucket with Block Public Access and SSE-S3 encryption enabled."""
+    """Create a private S3 bucket with Block Public Access, SSE-S3 encryption, and TLS enforcement."""
     create_kwargs: Dict[str, Any] = {"Bucket": bucket_name}
     if region != "us-east-1":
         create_kwargs["CreateBucketConfiguration"] = {"LocationConstraint": region}
@@ -67,6 +69,36 @@ def create_private_bucket(
         )
     except Exception as e:
         logger.debug(f"Could not explicitly set bucket encryption (default applied): {e}")
+
+    # Enforce in-transit encryption (HTTPS/TLS only) via Bucket Policy
+    tls_policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Sid": "EnforceTLSRequestsOnly",
+                "Effect": "Deny",
+                "Principal": "*",
+                "Action": "s3:*",
+                "Resource": [
+                    f"arn:aws:s3:::{bucket_name}",
+                    f"arn:aws:s3:::{bucket_name}/*",
+                ],
+                "Condition": {
+                    "Bool": {
+                        "aws:SecureTransport": "false"
+                    }
+                },
+            }
+        ],
+    }
+    try:
+        logger.info(f"Applying TLS-enforcement bucket policy on '{bucket_name}'...")
+        s3_client.put_bucket_policy(
+            Bucket=bucket_name,
+            Policy=json.dumps(tls_policy),
+        )
+    except Exception as e:
+        logger.warning(f"Could not apply TLS bucket policy on '{bucket_name}': {e}")
 
     # Apply resource tags
     if tags:
@@ -229,11 +261,44 @@ def verify_s3_resources(
             )
         )
 
-    # 3. Verify each expected document exists and has valid metadata
+    # 3. Verify in-transit encryption (TLS/HTTPS enforcement policy)
+    try:
+        policy_resp = s3_client.get_bucket_policy(Bucket=bucket_name)
+        policy_raw = policy_resp.get("Policy", "{}")
+        policy_data = json.loads(policy_raw) if isinstance(policy_raw, str) else policy_raw
+        has_tls_enforce = any(
+            stmt.get("Effect") == "Deny"
+            and stmt.get("Condition", {}).get("Bool", {}).get("aws:SecureTransport") in ("false", False)
+            for stmt in policy_data.get("Statement", [])
+        )
+        checks.append(
+            VerificationCheck(
+                check_id=f"s3-tls-{bucket_name}",
+                name="S3 In-Transit TLS Enforcement",
+                description="Verify bucket policy strictly denies non-HTTPS/TLS requests",
+                passed=has_tls_enforce,
+                expected="Deny statement for aws:SecureTransport == false",
+                actual="TLS enforcement policy active" if has_tls_enforce else "No TLS deny policy found",
+            )
+        )
+    except Exception as e:
+        checks.append(
+            VerificationCheck(
+                check_id=f"s3-tls-{bucket_name}",
+                name="S3 In-Transit TLS Enforcement",
+                description="Verify bucket policy strictly denies non-HTTPS/TLS requests",
+                passed=False,
+                expected="Deny statement for aws:SecureTransport == false",
+                actual=f"Could not verify bucket policy: {e}",
+            )
+        )
+
+    # 4. Verify each expected document exists and has valid metadata
     for key in expected_keys:
         try:
             head = s3_client.head_object(Bucket=bucket_name, Key=key)
             size = head.get("ContentLength", 0)
+            clean_etag = head.get("ETag", "").strip('"')
             checks.append(
                 VerificationCheck(
                     check_id=f"s3-doc-{key}",
@@ -241,7 +306,7 @@ def verify_s3_resources(
                     description=f"Verify document {key} exists with size > 0",
                     passed=size > 0,
                     expected=f"Object '{key}' exists with size > 0 bytes",
-                    actual=f"Object exists (size: {size} bytes, ETag: {head.get('ETag', '').strip('\"')})",
+                    actual=f"Object exists (size: {size} bytes, ETag: {clean_etag})",
                 )
             )
         except Exception as e:
@@ -264,9 +329,43 @@ def cleanup_s3_resources(
     s3_client: Any,
     bucket_name: str,
     tracked_object_keys: Optional[List[str]] = None,
+    expected_run_id: Optional[str] = None,
 ) -> List[str]:
-    """Delete tracked objects and remove the bucket cleanly."""
+    """Delete tracked objects and remove the bucket cleanly.
+
+    Enforces strict ownership validation against expected_run_id and handles already-deleted buckets idempotently.
+    """
     deleted: List[str] = []
+
+    # Verify ownership before draining or deleting bucket
+    if expected_run_id:
+        try:
+            tagging = s3_client.get_bucket_tagging(Bucket=bucket_name)
+            tags = {t["Key"]: t["Value"] for t in tagging.get("TagSet", [])}
+            is_owned = tags.get("ManagedBy") == "CloudPrac" and tags.get("RunId") == expected_run_id
+            if not is_owned:
+                logger.error(
+                    f"Ownership check failed for S3 bucket '{bucket_name}': "
+                    f"Tags {tags} do not verify ownership (expected ManagedBy=CloudPrac, RunId={expected_run_id}). "
+                    "Skipping deletion to prevent accidental destruction."
+                )
+                return []
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code")
+            if code in ("NoSuchBucket", "NotFound"):
+                logger.info(f"S3 bucket '{bucket_name}' not found. Already cleaned up.")
+                return []
+            logger.error(
+                f"Ownership check failed for S3 bucket '{bucket_name}': {e}. "
+                "Skipping deletion to prevent accidental destruction."
+            )
+            return []
+        except Exception as e:
+            logger.error(
+                f"Unexpected error inspecting tags on S3 bucket '{bucket_name}': {e}. "
+                "Skipping deletion to prevent accidental destruction."
+            )
+            return []
 
     # 1. Delete tracked objects or all objects if created by run
     try:
@@ -289,6 +388,9 @@ def cleanup_s3_resources(
                 )
                 deleted.extend([f"s3://{bucket_name}/{item['Key']}" for item in contents])
     except ClientError as e:
+        code = e.response.get("Error", {}).get("Code")
+        if code in ("NoSuchBucket", "NotFound"):
+            return []
         logger.warning(f"Error removing objects from bucket '{bucket_name}': {e}")
 
     # 2. Delete the bucket
@@ -297,7 +399,11 @@ def cleanup_s3_resources(
         s3_client.delete_bucket(Bucket=bucket_name)
         deleted.append(f"s3-bucket:{bucket_name}")
     except ClientError as e:
-        logger.error(f"Failed to delete S3 bucket '{bucket_name}': {e}")
-        raise
+        code = e.response.get("Error", {}).get("Code")
+        if code in ("NoSuchBucket", "NotFound"):
+            logger.info(f"S3 bucket '{bucket_name}' already gone.")
+        else:
+            logger.error(f"Failed to delete S3 bucket '{bucket_name}': {e}")
+            raise
 
     return deleted

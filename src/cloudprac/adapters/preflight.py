@@ -4,7 +4,8 @@ import os
 import shutil
 import subprocess
 import sys
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
+
 from pydantic import BaseModel, Field
 
 from cloudprac.adapters.aws_client import AWSAdapter, mask_account_id

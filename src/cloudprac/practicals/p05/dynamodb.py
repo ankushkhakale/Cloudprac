@@ -2,6 +2,7 @@
 
 import time
 from typing import Any, Dict, List, Optional
+
 from botocore.exceptions import ClientError
 
 from cloudprac.core.models import VerificationCheck
@@ -210,6 +211,16 @@ def verify_dynamodb_resources(
                 actual=f"Partition key is '{hash_key}'",
             )
         )
+        checks.append(
+            VerificationCheck(
+                check_id=f"dynamodb-billing-{table_name}",
+                name="DynamoDB Billing Mode (PAY_PER_REQUEST)",
+                description="Verify on-demand billing mode to prevent idle cost",
+                passed=billing_mode == "PAY_PER_REQUEST",
+                expected="BillingMode == 'PAY_PER_REQUEST'",
+                actual=f"BillingMode is '{billing_mode}'",
+            )
+        )
     except Exception as e:
         checks.append(
             VerificationCheck(
@@ -269,14 +280,64 @@ def verify_dynamodb_resources(
     return checks
 
 
-def cleanup_dynamodb_resources(dynamodb_client: Any, table_name: str) -> List[str]:
-    """Delete the DynamoDB table cleanly."""
+def cleanup_dynamodb_resources(
+    dynamodb_client: Any,
+    table_name: str,
+    expected_run_id: Optional[str] = None,
+) -> List[str]:
+    """Delete the DynamoDB table cleanly.
+
+    Enforces ownership validation against expected_run_id and handles already-deleted tables idempotently.
+    """
     deleted: List[str] = []
+
+    # Verify ownership before deletion
+    if expected_run_id:
+        try:
+            desc = dynamodb_client.describe_table(TableName=table_name)
+            table_arn = desc.get("Table", {}).get("TableArn")
+            if not table_arn:
+                logger.error(
+                    f"Could not retrieve TableArn for table '{table_name}'. "
+                    "Skipping deletion to prevent accidental destruction."
+                )
+                return []
+            tags_resp = dynamodb_client.list_tags_of_resource(ResourceArn=table_arn)
+            tags = {t["Key"]: t["Value"] for t in tags_resp.get("Tags", [])}
+            is_owned = tags.get("ManagedBy") == "CloudPrac" and tags.get("RunId") == expected_run_id
+            if not is_owned:
+                logger.error(
+                    f"Ownership check failed for DynamoDB table '{table_name}': "
+                    f"Tags {tags} do not verify ownership (expected ManagedBy=CloudPrac, RunId={expected_run_id}). "
+                    "Skipping deletion to prevent accidental destruction."
+                )
+                return []
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code")
+            if code in ("ResourceNotFoundException", "TableNotFoundException"):
+                logger.info(f"DynamoDB table '{table_name}' not found. Already cleaned up.")
+                return []
+            logger.error(
+                f"Ownership check failed for DynamoDB table '{table_name}': {e}. "
+                "Skipping deletion to prevent accidental destruction."
+            )
+            return []
+        except Exception as e:
+            logger.error(
+                f"Unexpected error inspecting tags on table '{table_name}': {e}. "
+                "Skipping deletion to prevent accidental destruction."
+            )
+            return []
+
     try:
         logger.info(f"Deleting DynamoDB table '{table_name}'...")
         dynamodb_client.delete_table(TableName=table_name)
         deleted.append(f"dynamodb-table:{table_name}")
     except ClientError as e:
-        logger.error(f"Failed to delete DynamoDB table '{table_name}': {e}")
-        raise
+        code = e.response.get("Error", {}).get("Code")
+        if code in ("ResourceNotFoundException", "TableNotFoundException"):
+            logger.info(f"DynamoDB table '{table_name}' already gone.")
+        else:
+            logger.error(f"Failed to delete DynamoDB table '{table_name}': {e}")
+            raise
     return deleted

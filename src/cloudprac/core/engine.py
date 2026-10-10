@@ -1,14 +1,13 @@
 """Controlled execution engine orchestrating practical lifecycles."""
 
 import json
-from typing import Any, Optional
+from typing import Optional
 
 from cloudprac.adapters.aws_client import AWSAdapter
 from cloudprac.core.cleaner import CleanupEngine
 from cloudprac.core.contract import PracticalContract, PracticalNotConfiguredError
 from cloudprac.core.models import (
     CleanupResult,
-    ExecutionPlan,
     ExecutionResult,
     PracticalStatus,
     VerificationResult,

@@ -39,7 +39,7 @@ CloudPrac's authoritative registry aligns with the official college curriculum:
 | **P02** | **Customer Data Management** | AWS Cloud | `NOT CONFIGURED` | Not estimated |
 | **P03** | **Employee Attendance System** | AWS Cloud | `NOT CONFIGURED` | Not estimated |
 | **P04** | **Online Billing System** | AWS Cloud | `NOT CONFIGURED` | Not estimated |
-| **P05** | **EC2, S3 and DynamoDB Implementation: Student Record Management** | AWS Cloud (EC2, S3, DynamoDB) | **`CONFIGURED`** | Free Tier eligible *(< $0.05)* |
+| **P05** | **EC2, S3 and DynamoDB Implementation: Student Record Management** | AWS Cloud (EC2, S3, DynamoDB) | **`CONFIGURED`** | Unverified exact cost (Free Tier eligible resources + billable public IPv4) |
 | **P06** | **EC2, S3 and DynamoDB Implementation: Employee Record Management** | AWS Cloud | `NOT CONFIGURED` | Not estimated |
 | **P07** | **EC2, S3 and DynamoDB Implementation: Library Management** | AWS Cloud | `NOT CONFIGURED` | Not estimated |
 | **P08** | **Implementation of the CIA Model** | Isolated Linux / EC2 | `NOT CONFIGURED` | Not estimated |
@@ -85,7 +85,9 @@ Student / Browser ─┼─► Port 5000: Flask Web App (systemd service) │
 2. **Amazon S3 (Document Storage)**:
    - Private bucket: `cloudprac-p05-<account_id>-<run_id>`
    - Block Public Access enabled across all 4 settings.
-   - Server-Side Encryption: `AES256` (SSE-S3).
+   - In-Transit Encryption: HTTPS/TLS enforced via bucket policy (`aws:SecureTransport: "false"` Deny condition).
+   - At-Rest Server-Side Encryption: Amazon S3-managed keys (`AES256` / SSE-S3 default encryption; does not claim or require custom KMS keys or client-side encryption).
+   - Least-Privilege Scoping: EC2 instance role has read-only `s3:GetObject` on `secrets/*`, while `s3:PutObject` is strictly scoped to `documents/*`.
    - Document upload/download with SHA-256 integrity verification.
 
 3. **Amazon EC2 (Compute & Application Hosting)**:
@@ -149,21 +151,22 @@ cloudprac inspect P01
 ### Step 3: Plan P05 (Dry Run)
 Generate a 7-step execution plan without modifying AWS:
 ```bash
-cloudprac plan P05
+cloudprac plan P05 --app-cidr <your-ip>/32
 ```
 Options available:
-- `--region <region>`: AWS Region (e.g. `us-east-1`)
+- `--region <region>`: AWS Region (e.g. `us-east-1`, default: `us-east-1`)
 - `--instance-type <type>`: EC2 instance type (default: `t2.micro`)
 - `--app-port <port>`: Application port (default: `5000`)
-- `--app-cidr <cidr>`: Inbound CIDR restriction for web app (default: `0.0.0.0/0`)
+- `--app-cidr <cidr>`: Inbound IPv4 CIDR restriction for web app (**REQUIRED**: Must be an explicit restricted CIDR such as `<your-ip>/32` or your VPC CIDR. Broad `0.0.0.0/0` access is strictly blocked to protect student records. Alias: `--cidr <cidr>`.)
+- `--ssh-cidr <cidr>`: Inbound IPv4 CIDR restriction for SSH port 22 (default: `127.0.0.1/32`)
 
 ### Step 4: Execute P05 (Provision & Deploy)
 ```bash
 # Interactive execution (prompts for confirmation before creating cloud resources)
-cloudprac run P05
+cloudprac run P05 --app-cidr <your-ip>/32
 
-# Non-interactive execution (for automated testing/CloudShell labs)
-cloudprac run P05 --yes
+# Non-interactive execution (for automated testing / scripted labs)
+cloudprac run P05 --app-cidr <your-ip>/32 --yes
 ```
 
 CloudPrac will:
@@ -209,11 +212,53 @@ To execute P05, the student's IAM identity needs permissions for:
 - **DynamoDB**: `CreateTable`, `DescribeTable`, `DeleteTable`, `PutItem`, `GetItem`, `UpdateItem`, `DeleteItem`, `Scan`
 - **IAM**: `CreateRole`, `DeleteRole`, `PutRolePolicy`, `DeleteRolePolicy`, `CreateInstanceProfile`, `DeleteInstanceProfile`, `AddRoleToInstanceProfile`, `RemoveRoleFromInstanceProfile`, `PassRole`
 
-### Cost Transparency
-- **EC2 Compute & EBS**: Free Tier eligible (`t2.micro` / `t3.micro` + 8 GB gp3). Note: AWS charges for public IPv4 addresses (~$0.005/hour).
-- **S3 & DynamoDB**: On-Demand requests and minimal storage fall well within monthly AWS Free Tier allowances.
-- **Total estimated cost for a 30-minute student lab**: Less than **$0.05**.
-- **Important**: Always run `cloudprac cleanup P05` after completing evaluation.
+### Web Application Authentication & Access Control
+- **Inbound CIDR Restriction**: Application port 5000 is restricted exclusively to the administrator-specified `--app-cidr` (e.g. `203.0.113.10/32` or your VPC CIDR). Public ingress (`0.0.0.0/0`) is strictly rejected.
+- **Admin Authentication**: Mutating API operations (`POST`, `PUT`, `DELETE`) require token authentication via the `X-Admin-Token` header or `Authorization: Bearer <token>`. Query-string authentication (`?token=...`) is strictly rejected to prevent credentials from being recorded in web access logs.
+- **Secure Secret Delivery**: The admin token is never embedded in EC2 user data, bootstrap scripts, or console logs. For each run, a unique 32-byte cryptographically secure token is generated, stored in the private S3 bucket, and fetched at runtime by the EC2 instance using attached IAM instance profile credentials.
+- **Local Credential Storage**: The token is saved locally to `~/.cloudprac/runs/<run_id>/admin_token` with `0600` permissions (restricted strictly to the current user).
+  ```bash
+  # Retrieve the generated token from the local run directory:
+  TOKEN=$(cat ~/.cloudprac/runs/<run_id>/admin_token)
+
+  # Example authorized student creation using headers only:
+  curl -X POST http://<EC2-IP>:5000/api/students \
+    -H "Content-Type: application/json" \
+    -H "X-Admin-Token: ${TOKEN}" \
+    -d '{"student_id": "STU-105", "name": "Kavya Menon", "course": "B.Tech CS"}'
+  ```
+
+### S3 Data Protection & Encryption Disclosures
+- **In-Transit Encryption**: All communication between clients, the EC2 instance, and Amazon S3 uses HTTPS/TLS. Furthermore, an explicit bucket policy is attached to the private S3 bucket denying any requests where `aws:SecureTransport` is `false`.
+- **Default Server-Side Encryption (SSE-S3)**: Amazon S3 automatically applies default server-side encryption with Amazon S3-managed AES-256 keys (`AES256` / SSE-S3). No customer-managed AWS KMS keys (SSE-KMS) or client-side cryptography are configured or claimed, avoiding KMS pricing overhead while meeting AWS baseline security benchmarks.
+- **Block Public Access**: All four S3 Block Public Access settings (`BlockPublicAcls`, `IgnorePublicAcls`, `BlockPublicPolicy`, `RestrictPublicBuckets`) are enforced on bucket creation.
+- **Least-Privilege Scoping**: The attached EC2 IAM instance profile is strictly scoped: `s3:GetObject` on `secrets/*` (read-only token access), `s3:PutObject` strictly on `documents/*` (prevents overwriting or tampering with tokens), and `s3:ListBucket` on the bucket root.
+
+### Cost Transparency & Disclosures
+- **Unverified Exact Cost**: CloudPrac does not guarantee that practical deployments are free or will cost less than $0.05. Actual charges depend on individual account Free Tier status, AWS pricing regions, and runtime.
+- **Billable Public IPv4 Addresses**: Since February 2024, AWS charges ~$0.005/hour for all public IPv4 addresses attached to EC2 instances across all accounts, including Free Tier accounts.
+- **Standard Service Rates**: EC2 compute (`t2.micro` / `t3.micro`), EBS root volume (8 GB gp3), Amazon S3 storage/requests, and Amazon DynamoDB operations consume account allowances or incur standard AWS on-demand charges.
+- **Cost Minimization**: Always run `cloudprac cleanup P05 --run-id <run_id>` immediately after finishing laboratory demonstration and verification.
+
+### Partial Failure Recovery & Fail-Closed Cleanup Ownership
+CloudPrac implements incremental manifest checkpointing at every resource creation stage:
+1. **Stage 1 (S3 Bucket & Object)**: Bucket, initial document, and admin token are tracked in `manifest.json`.
+2. **Stage 2 (DynamoDB Table & Records)**: Table and sample items are appended and checkpointed.
+3. **Stage 3 (IAM Role & Instance Profile)**: Profile and role are appended and checkpointed.
+4. **Stage 4 (Security Group & Key Pair)**: Networking resources are appended and checkpointed.
+5. **Stage 5 (EC2 Virtual Machine)**: Instance ID is appended and checkpointed.
+
+If a failure or interruption occurs at any stage (e.g. EC2 launch fails due to regional capacity), running:
+```bash
+cloudprac cleanup P05 --run-id <run_id>
+```
+reads the checkpointed manifest and cleanly dismantles every resource created up to the point of failure.
+
+**Ownership & Deletion Safety**:
+- **Affirmative Tag Matching**: Cleanup verifies `ManagedBy == 'CloudPrac'` and `RunId == <run_id>` before destroying any EC2 instance, security group, key pair, S3 bucket, DynamoDB table, or IAM role/profile.
+- **Fail-Closed on Missing or Mismatched Tags**: Resources lacking tags or tagged with a different RunId are strictly skipped.
+- **Fail-Closed on API Inspection Errors**: If describing or reading tags encounters an error (e.g. `AccessDenied` or network timeout), the cleanup engine immediately aborts deletion of that resource to prevent accidental data loss.
+- **Secret Object & Local Credential Cleanup**: The S3 secret token object (`secrets/<run_id>/admin_token`) and local restricted credential file (`~/.cloudprac/runs/<run_id>/admin_token`) are cleanly deleted upon cleanup completion.
 
 ---
 
@@ -225,15 +270,23 @@ All unit and mock tests run **100% offline** without live credentials:
 .venv/bin/pytest -v
 ```
 
-### Test Suite Highlights (37 tests):
+### Test Suite Highlights (59 tests passing):
 - **CLI Suite**: `list`, `inspect`, `plan`, `run`, `verify`, `report`, `cleanup`, `preflight`.
 - **Registry & Safety**: P01 local virtualization notice and safety blocking, unconfigured practicals P02–P04 and P06–P08 strictly prevented from planning or execution.
 - **P05 Modules**:
-  - `ec2.py`: AMI dynamic lookup, VPC/subnet resolution, security group rules, EC2 launch, state polling, user-data bootstrap script generation.
-  - `s3.py`: Bucket creation with regional LocationConstraint handling, Block Public Access, upload, download, and SHA-256 integrity hashing.
+  - `ec2.py`: AMI dynamic lookup, VPC/subnet resolution, CIDR validation rules, security group rules, EC2 launch, state polling, user-data bootstrap script generation.
+  - `s3.py`: Bucket creation with regional LocationConstraint handling, Block Public Access, TLS bucket policy enforcement, upload, download, and SHA-256 integrity hashing.
   - `dynamodb.py`: Table creation, active waiting, CRUD operations (`PutItem`, `GetItem`, `UpdateItem`, `DeleteItem`).
-  - `iam.py`: Least-privilege IAM policy generation, instance profile lifecycle.
-  - `web_app.py`: Real Flask application with `/health`, `/api/students`, and document endpoints tested via Flask test client.
+  - `iam.py`: Least-privilege IAM policy generation (scoped document/secret statements), instance profile lifecycle, independent resource cleanup.
+  - `web_app.py`: Real Flask application with token authentication, file extension verification, sanitized error responses, `/health`, `/api/students`, and document endpoints tested via Flask test client.
+- **Security & Failure Regressions**:
+  - S3 bucket policy TLS in-transit encryption enforcement (`aws:SecureTransport: "false"` Deny).
+  - IAM least-privilege scoping: token object is read-only, PutObject restricted to `documents/*`.
+  - Fail-closed cleanup: untagged resources and mismatched RunIds strictly refused across EC2, S3, DynamoDB, and IAM.
+  - Cleanup ownership API errors fail closed without deleting resources.
+  - Local admin token file (`0600`) safely deleted during cleanup.
+  - Run manifests strictly verify zero raw admin token exposure.
+  - Public CIDR rejection (`0.0.0.0/0`), plan side-effect prevention, error sanitization.
 - **Full End-to-End Mock Lifecycle**: Tests planner, engine, verifier, reporter, and cleaner through `ExecutionEngine` in mock mode.
 
 ---

@@ -3,6 +3,7 @@
 import json
 import time
 from typing import Any, Dict, List, Optional
+
 from botocore.exceptions import ClientError
 
 from cloudprac.utils.logging import get_logger
@@ -26,8 +27,16 @@ def build_least_privilege_policy(
     table_name: str,
     region: str,
     account_id: str,
+    secret_prefix: str = "secrets",
 ) -> Dict[str, Any]:
-    """Generate least-privilege IAM policy document granting S3 and DynamoDB access for student records."""
+    """Generate least-privilege IAM policy document granting scoped S3 and DynamoDB access.
+
+    Least-Privilege Scoping:
+    - S3 Document Access: Allows s3:GetObject and s3:PutObject strictly on documents/* prefix.
+    - S3 Secret Token Access: Allows s3:GetObject strictly on secrets/* prefix (read-only; EC2 cannot modify or delete token).
+    - S3 Bucket Listing: Allows s3:ListBucket on the bucket itself.
+    - DynamoDB Record Access: Allows CRUD strictly on the specific student table ARN.
+    """
     bucket_arn = f"arn:aws:s3:::{bucket_name}"
     table_arn = f"arn:aws:dynamodb:{region}:{account_id}:table/{table_name}"
 
@@ -40,12 +49,24 @@ def build_least_privilege_policy(
                 "Action": [
                     "s3:GetObject",
                     "s3:PutObject",
+                ],
+                "Resource": f"{bucket_arn}/documents/*",
+            },
+            {
+                "Sid": "S3SecretTokenReadOnly",
+                "Effect": "Allow",
+                "Action": [
+                    "s3:GetObject",
+                ],
+                "Resource": f"{bucket_arn}/{secret_prefix}/*",
+            },
+            {
+                "Sid": "S3BucketListing",
+                "Effect": "Allow",
+                "Action": [
                     "s3:ListBucket",
                 ],
-                "Resource": [
-                    bucket_arn,
-                    f"{bucket_arn}/*",
-                ],
+                "Resource": bucket_arn,
             },
             {
                 "Sid": "DynamoDBStudentRecordAccess",
@@ -62,6 +83,7 @@ def build_least_privilege_policy(
             },
         ],
     }
+
 
 
 def setup_instance_profile(
@@ -147,47 +169,103 @@ def setup_instance_profile(
 
 def cleanup_iam_resources(
     iam_client: Any,
-    role_name: str,
-    profile_name: str,
+    role_name: Optional[str] = None,
+    profile_name: Optional[str] = None,
     policy_name: str = "CloudPracStudentRecordPolicy",
+    expected_run_id: Optional[str] = None,
 ) -> List[str]:
-    """Tear down instance profile, remove roles, and delete IAM role cleanly."""
+    """Tear down instance profile, remove attached roles, and delete IAM role cleanly.
+
+    Enforces ownership validation against expected_run_id and handles already-deleted resources idempotently.
+    """
     deleted: List[str] = []
 
-    # 1. Remove role from instance profile
-    try:
-        logger.info(f"Removing role '{role_name}' from instance profile '{profile_name}'...")
-        iam_client.remove_role_from_instance_profile(
-            InstanceProfileName=profile_name,
-            RoleName=role_name,
-        )
-    except Exception as e:
-        logger.debug(f"Could not remove role from profile (might already be removed): {e}")
+    # 1. Clean up instance profile if specified
+    if profile_name:
+        should_delete_profile = True
+        try:
+            prof_resp = iam_client.get_instance_profile(InstanceProfileName=profile_name)
+            inst_profile = prof_resp.get("InstanceProfile", {})
+            if expected_run_id:
+                tags = {t["Key"]: t["Value"] for t in inst_profile.get("Tags", [])}
+                is_owned = tags.get("ManagedBy") == "CloudPrac" and tags.get("RunId") == expected_run_id
+                if not is_owned:
+                    logger.error(
+                        f"Ownership check failed for IAM instance profile '{profile_name}': "
+                        f"Tags {tags} do not verify ownership (expected ManagedBy=CloudPrac, RunId={expected_run_id}). "
+                        "Skipping deletion to prevent accidental destruction."
+                    )
+                    should_delete_profile = False
 
-    # 2. Delete instance profile
-    try:
-        logger.info(f"Deleting instance profile '{profile_name}'...")
-        iam_client.delete_instance_profile(InstanceProfileName=profile_name)
-        deleted.append(f"iam-instance-profile:{profile_name}")
-    except Exception as e:
-        logger.warning(f"Could not delete instance profile '{profile_name}': {e}")
+            if should_delete_profile:
+                for r in inst_profile.get("Roles", []):
+                    r_name = r.get("RoleName")
+                    try:
+                        iam_client.remove_role_from_instance_profile(
+                            InstanceProfileName=profile_name,
+                            RoleName=r_name,
+                        )
+                    except Exception as e:
+                        logger.debug(f"Could not remove role '{r_name}' from profile: {e}")
 
-    # 3. Delete inline policy from role
-    try:
-        logger.info(f"Deleting inline policy '{policy_name}' from role '{role_name}'...")
-        iam_client.delete_role_policy(
-            RoleName=role_name,
-            PolicyName=policy_name,
-        )
-    except Exception as e:
-        logger.debug(f"Could not delete role policy '{policy_name}': {e}")
+                logger.info(f"Deleting instance profile '{profile_name}'...")
+                iam_client.delete_instance_profile(InstanceProfileName=profile_name)
+                deleted.append(f"iam-instance-profile:{profile_name}")
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == "NoSuchEntity":
+                logger.info(f"IAM instance profile '{profile_name}' not found. Already cleaned up.")
+            else:
+                logger.error(f"Could not verify or delete instance profile '{profile_name}': {e}. Skipping deletion.")
+        except Exception as e:
+            logger.error(f"Unexpected error inspecting instance profile '{profile_name}': {e}. Skipping deletion.")
 
-    # 4. Delete IAM Role
-    try:
-        logger.info(f"Deleting IAM Role '{role_name}'...")
-        iam_client.delete_role(RoleName=role_name)
-        deleted.append(f"iam-role:{role_name}")
-    except Exception as e:
-        logger.warning(f"Could not delete IAM Role '{role_name}': {e}")
+    # 2. Clean up IAM role if specified
+    if role_name:
+        should_delete_role = True
+        try:
+            if expected_run_id:
+                try:
+                    tags_resp = iam_client.list_role_tags(RoleName=role_name)
+                    tags = {t["Key"]: t["Value"] for t in tags_resp.get("Tags", [])}
+                    is_owned = tags.get("ManagedBy") == "CloudPrac" and tags.get("RunId") == expected_run_id
+                    if not is_owned:
+                        logger.error(
+                            f"Ownership check failed for IAM role '{role_name}': "
+                            f"Tags {tags} do not verify ownership (expected ManagedBy=CloudPrac, RunId={expected_run_id}). "
+                            "Skipping deletion to prevent accidental destruction."
+                        )
+                        should_delete_role = False
+                except ClientError as e:
+                    if e.response.get("Error", {}).get("Code") == "NoSuchEntity":
+                        logger.info(f"IAM role '{role_name}' not found. Already cleaned up.")
+                        should_delete_role = False
+                    else:
+                        logger.error(f"Ownership check failed for IAM role '{role_name}': {e}. Skipping deletion.")
+                        should_delete_role = False
+                except Exception as e:
+                    logger.error(f"Unexpected error inspecting tags on IAM role '{role_name}': {e}. Skipping deletion.")
+                    should_delete_role = False
+
+            if should_delete_role:
+                try:
+                    pol_resp = iam_client.list_role_policies(RoleName=role_name)
+                    for p in pol_resp.get("PolicyNames", []):
+                        try:
+                            iam_client.delete_role_policy(RoleName=role_name, PolicyName=p)
+                        except Exception as e:
+                            logger.debug(f"Could not delete policy '{p}': {e}")
+                except Exception as e:
+                    logger.debug(f"Could not list policies for role '{role_name}': {e}")
+
+                logger.info(f"Deleting IAM Role '{role_name}'...")
+                iam_client.delete_role(RoleName=role_name)
+                deleted.append(f"iam-role:{role_name}")
+        except ClientError as e:
+            if e.response.get("Error", {}).get("Code") == "NoSuchEntity":
+                logger.info(f"IAM role '{role_name}' not found. Already cleaned up.")
+            else:
+                logger.error(f"Could not delete IAM Role '{role_name}': {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error inspecting/deleting IAM Role '{role_name}': {e}")
 
     return deleted

@@ -1,6 +1,7 @@
 """Configuration models for Practical 05 (Student Record Management using EC2, S3, and DynamoDB)."""
 
 from typing import Optional
+
 from pydantic import BaseModel, Field
 
 

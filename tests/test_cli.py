@@ -1,6 +1,5 @@
 """Unit tests for CloudPrac CLI command parsing and output."""
 
-import pytest
 from typer.testing import CliRunner
 
 from cloudprac.cli.main import app
@@ -105,3 +104,19 @@ def test_cli_preflight():
     assert result.exit_code == 0
     assert "Environment Preflight Diagnostics" in result.output
     assert "PASS" in result.output
+
+
+def test_cli_plan_and_run_accept_cidr_alias():
+    """Verify cloudprac plan accepts both --app-cidr and --cidr options."""
+    res1 = runner.invoke(app, ["plan", "P05", "--app-cidr", "192.0.2.1/32"])
+    assert res1.exit_code == 0
+    assert "Execution Plan: P05" in res1.output
+
+    res2 = runner.invoke(app, ["plan", "P05", "--cidr", "192.0.2.1/32"])
+    assert res2.exit_code == 0
+    assert "Execution Plan: P05" in res2.output
+
+    # Confirm verify command exists and accepts --help
+    res3 = runner.invoke(app, ["verify", "--help"])
+    assert res3.exit_code == 0
+    assert "Verify postcondition states on AWS" in res3.output

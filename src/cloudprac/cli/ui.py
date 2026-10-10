@@ -1,6 +1,7 @@
 """Rich terminal user interface styling and layout for CloudPrac."""
 
 from typing import Any, Dict, List
+
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -78,24 +79,24 @@ def print_inspect_panel(details: Dict[str, Any]) -> None:
     prereqs = details.get("prerequisites", [])
 
     body = Text()
-    body.append(f"Module ID: ", style="bold cyan")
+    body.append("Module ID: ", style="bold cyan")
     body.append(f"{pid}\n")
-    body.append(f"Title: ", style="bold cyan")
+    body.append("Title: ", style="bold cyan")
     body.append(f"{title}\n")
-    body.append(f"Status: ", style="bold cyan")
+    body.append("Status: ", style="bold cyan")
     if status == PracticalStatus.NOT_CONFIGURED.value:
         body.append(f"{status}\n", style="bold yellow")
     else:
         body.append(f"{status}\n", style="bold green")
 
-    body.append(f"\nDescription:\n", style="bold white")
+    body.append("\nDescription:\n", style="bold white")
     body.append(f"{description}\n\n")
 
     if notice:
         body.append(f"Notice: {notice}\n\n", style="yellow")
 
     if prereqs:
-        body.append(f"Prerequisites:\n", style="bold white")
+        body.append("Prerequisites:\n", style="bold white")
         for req in prereqs:
             body.append(f"  • {req}\n", style="dim")
 

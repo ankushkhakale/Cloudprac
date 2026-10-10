@@ -1,7 +1,6 @@
 """Practical 05 implementation: Student Record Management using EC2, S3, and DynamoDB."""
 
 import re
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from cloudprac.adapters.aws_client import AWSAdapter, mask_account_id
@@ -22,11 +21,8 @@ from cloudprac.practicals.p05.config import P05Config
 from cloudprac.practicals.p05.dynamodb import (
     cleanup_dynamodb_resources,
     create_student_table,
-    delete_student_record,
     get_student_record,
-    insert_student_record,
     insert_student_records,
-    list_student_records,
     update_student_record,
     verify_dynamodb_resources,
     wait_for_table_active,
@@ -49,8 +45,6 @@ from cloudprac.practicals.p05.iam import (
 from cloudprac.practicals.p05.s3 import (
     cleanup_s3_resources,
     create_private_bucket,
-    download_document_from_s3,
-    list_student_documents,
     upload_document_to_s3,
     verify_s3_resources,
 )
@@ -60,7 +54,7 @@ from cloudprac.practicals.p05.sample_data import (
 )
 from cloudprac.utils.config import CloudPracConfig
 from cloudprac.utils.logging import get_logger
-from cloudprac.utils.paths import get_cloudprac_home, get_run_dir
+from cloudprac.utils.paths import get_run_dir, save_restricted_file
 
 logger = get_logger()
 
@@ -85,7 +79,7 @@ class P05Practical(PracticalContract):
             category="Compute, Storage & Database",
             aws_services=["EC2", "S3", "DynamoDB", "IAM"],
             status=PracticalStatus.CONFIGURED,
-            estimated_cost="Free Tier eligible (hourly EC2/EBS/IPv4 charges apply if running past free tier; minimal cost < $0.05)",
+            estimated_cost="Potentially billable: EC2 compute, EBS volume (8GB gp3), public IPv4 address, S3 requests/storage, DynamoDB operations (charges depend on account Free Tier status and runtime; unverified exact cost)",
             prerequisites=[
                 "Valid AWS IAM credentials with EC2, S3, DynamoDB, and IAM permissions",
                 "Existing VPC and Subnet in target region (or permission to use default VPC)",
@@ -136,9 +130,7 @@ class P05Practical(PracticalContract):
         clean_run = sanitize_name(run_id)
         bucket_name = self.p05_config.bucket_name or f"cloudprac-p05-{clean_run}"
         table_name = self.p05_config.table_name or f"cloudprac-p05-students-{clean_run}"
-        role_name = self.p05_config.iam_role_name or f"cloudprac-p05-role-{clean_run}"
         profile_name = self.p05_config.iam_profile_name or f"cloudprac-p05-profile-{clean_run}"
-        key_name = self.p05_config.key_name or f"cloudprac-p05-key-{clean_run}"
         sg_name = f"cloudprac-p05-sg-{clean_run}"
 
         steps: List[ExecutionPlanStep] = [
@@ -147,6 +139,7 @@ class P05Practical(PracticalContract):
                 action="s3:CreateBucket & s3:PutPublicAccessBlock",
                 resource_type="s3-bucket",
                 resource_name=bucket_name,
+                estimated_cost="Standard S3 storage & request pricing",
                 description="Create private S3 bucket with Block Public Access and SSE-S3 encryption for student documents",
             ),
             ExecutionPlanStep(
@@ -154,6 +147,7 @@ class P05Practical(PracticalContract):
                 action="s3:PutObject",
                 resource_type="s3-object",
                 resource_name=f"s3://{bucket_name}/documents/STU-001-admission-certificate.txt",
+                estimated_cost="S3 PUT request rate",
                 description="Upload initial student document with metadata and SHA-256 integrity hash",
             ),
             ExecutionPlanStep(
@@ -161,6 +155,7 @@ class P05Practical(PracticalContract):
                 action="dynamodb:CreateTable",
                 resource_type="dynamodb-table",
                 resource_name=table_name,
+                estimated_cost="DynamoDB Pay-Per-Request pricing (zero idle cost)",
                 description="Create DynamoDB table with partition key 'student_id' (String) and PAY_PER_REQUEST billing",
             ),
             ExecutionPlanStep(
@@ -168,6 +163,7 @@ class P05Practical(PracticalContract):
                 action="dynamodb:PutItem",
                 resource_type="dynamodb-item",
                 resource_name=f"{table_name}#STU-001",
+                estimated_cost="DynamoDB Write Request Units",
                 description="Insert sample student records (Aarav Sharma, Priya Patel, Rohan Verma)",
             ),
             ExecutionPlanStep(
@@ -175,13 +171,15 @@ class P05Practical(PracticalContract):
                 action="iam:CreateRole & iam:CreateInstanceProfile",
                 resource_type="iam-instance-profile",
                 resource_name=profile_name,
+                estimated_cost="$0.00 (IAM is free of charge)",
                 description="Provision least-privilege IAM instance profile granting EC2 access to S3 bucket and DynamoDB table",
             ),
             ExecutionPlanStep(
                 step_number=6,
                 action="ec2:CreateSecurityGroup & ec2:AuthorizeSecurityGroupIngress",
                 resource_type="security-group",
-                resource_name=sg_name,
+                resource_name=f"{sg_name} [Port {self.p05_config.app_port} ingress: {self.p05_config.app_cidr or 'REQUIRED: provide --app-cidr <your-ip>/32'}]",
+                estimated_cost="$0.00 (Security Groups are free of charge)",
                 description=f"Create restricted security group allowing inbound port {self.p05_config.app_port} for web application",
             ),
             ExecutionPlanStep(
@@ -189,6 +187,7 @@ class P05Practical(PracticalContract):
                 action="ec2:RunInstances",
                 resource_type="ec2-instance",
                 resource_name=f"cloudprac-p05-app-{clean_run}",
+                estimated_cost="Standard On-Demand rate (public IPv4 ~$0.005/hr billable in all accounts)",
                 description=f"Launch {self.p05_config.instance_type} EC2 instance running Amazon Linux 2023 with Flask app bootstrap",
             ),
         ]
@@ -197,10 +196,12 @@ class P05Practical(PracticalContract):
             practical_id="P05",
             run_id=run_id,
             steps=steps,
-            estimated_total_cost=self._metadata.estimated_cost,
+            estimated_total_cost="Unverified exact cost - billable AWS resources deployed (EC2 compute, EBS gp3, public IPv4, S3, DynamoDB). Not guaranteed to be free; tear down promptly via 'cloudprac cleanup P05'.",
             warnings=[
                 "This practical provisions real AWS resources in your configured account.",
-                "Always run 'cloudprac cleanup P05' after your lab evaluation to avoid unexpected charges.",
+                "Application security: Inbound access to port 5000 requires an explicit restricted CIDR (e.g. --app-cidr <your-ip>/32). Broad access (0.0.0.0/0) is strictly blocked.",
+                "Cost transparency: Public IPv4 addresses incur hourly charges (~$0.005/hr) in all AWS accounts. EC2, EBS, S3, and DynamoDB charges depend on Free Tier eligibility.",
+                "Always run 'cloudprac cleanup P05 --run-id <run_id>' after your lab evaluation to avoid unexpected charges.",
             ],
         )
 
@@ -290,6 +291,9 @@ class P05Practical(PracticalContract):
             )
             run_dir = get_run_dir(plan.run_id)
             run_dir.mkdir(parents=True, exist_ok=True)
+            import secrets
+            mock_token = secrets.token_urlsafe(32)
+            save_restricted_file(run_dir / "admin_token", mock_token)
             manifest_path = run_dir / "manifest.json"
             manifest_path.write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
             return ExecutionResult(
@@ -303,6 +307,27 @@ class P05Practical(PracticalContract):
 
         tracked_resources: List[TrackedResource] = []
         errors: List[str] = []
+
+        # Validate explicit restricted CIDR before any cloud resource provisioning
+        if not self.p05_config.app_cidr or self.p05_config.app_cidr.strip() in ("0.0.0.0/0", "::/0") or self.p05_config.app_cidr.strip().endswith("/0"):
+            raise ValueError(
+                f"Execution halted: Opening application port {self.p05_config.app_port} to the public internet or an unspecified CIDR is prohibited to protect student records. "
+                "Provide an explicit restricted CIDR via --app-cidr (e.g. --app-cidr <your-ip>/32 or your VPC CIDR)."
+            )
+
+        run_dir = get_run_dir(plan.run_id)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = run_dir / "manifest.json"
+
+        def checkpoint_manifest() -> None:
+            manifest = RunManifest(
+                practical_id="P05",
+                run_id=plan.run_id,
+                aws_account_id=mask_account_id(raw_account),
+                aws_region=region,
+                resources=list(tracked_resources),
+            )
+            manifest_path.write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
 
         # ---------------------------------------------------------
         # 1. Provision Amazon S3 Private Bucket & Documents
@@ -325,11 +350,12 @@ class P05Practical(PracticalContract):
                     tags=tags,
                 )
             )
+            checkpoint_manifest()
 
             # Upload initial student document
             doc_content = get_sample_student_document("STU-001", "Aarav Sharma", plan.run_id)
             doc_key = "documents/STU-001-admission-certificate.txt"
-            upload_meta = upload_document_to_s3(
+            upload_document_to_s3(
                 s3_client=s3_client,
                 bucket_name=created_bucket,
                 object_key=doc_key,
@@ -343,6 +369,30 @@ class P05Practical(PracticalContract):
                     tags=tags,
                 )
             )
+            checkpoint_manifest()
+
+            # Generate and securely store unique admin token in private S3 bucket
+            import secrets
+            admin_token = secrets.token_urlsafe(32)
+            token_s3_key = f"secrets/{plan.run_id}/admin_token"
+            upload_document_to_s3(
+                s3_client=s3_client,
+                bucket_name=created_bucket,
+                object_key=token_s3_key,
+                content=admin_token,
+            )
+            tracked_resources.append(
+                TrackedResource(
+                    resource_type="s3-object",
+                    resource_id=f"s3://{created_bucket}/{token_s3_key}",
+                    resource_name=token_s3_key,
+                    tags=tags,
+                )
+            )
+            checkpoint_manifest()
+
+            # Save admin token locally with strict 0600 permissions restricted to current user
+            save_restricted_file(run_dir / "admin_token", admin_token)
         except Exception as e:
             logger.error(f"S3 provisioning failed: {e}")
             errors.append(f"S3 Error: {e}")
@@ -368,6 +418,7 @@ class P05Practical(PracticalContract):
                     tags=tags,
                 )
             )
+            checkpoint_manifest()
 
             # Wait for table to be ACTIVE
             wait_for_table_active(dynamodb_client, created_table)
@@ -385,6 +436,7 @@ class P05Practical(PracticalContract):
                         tags=tags,
                     )
                 )
+            checkpoint_manifest()
         except Exception as e:
             logger.error(f"DynamoDB provisioning failed: {e}")
             errors.append(f"DynamoDB Error: {e}")
@@ -423,6 +475,7 @@ class P05Practical(PracticalContract):
                     tags=tags,
                 )
             )
+            checkpoint_manifest()
         except Exception as e:
             logger.warning(f"IAM provisioning encountered issues (continuing with degraded role binding if restricted): {e}")
             errors.append(f"IAM Notice: {e}")
@@ -457,6 +510,7 @@ class P05Practical(PracticalContract):
                     tags=tags,
                 )
             )
+            checkpoint_manifest()
 
             # Key Pair
             if self.p05_config.create_key_pair:
@@ -473,15 +527,18 @@ class P05Practical(PracticalContract):
                         tags=tags,
                     )
                 )
+                checkpoint_manifest()
             else:
                 k_name = self.p05_config.key_name
 
-            # Build user-data bootstrap script for student-record Flask app
+            # Build user-data bootstrap script fetching admin token via S3 + IAM role
+            token_s3_key = f"secrets/{plan.run_id}/admin_token"
             user_data = build_user_data_script(
                 table_name=table_name,
                 bucket_name=bucket_name,
                 region=region,
                 app_port=self.p05_config.app_port,
+                token_s3_key=token_s3_key,
             )
 
             # ---------------------------------------------------------
@@ -508,6 +565,7 @@ class P05Practical(PracticalContract):
                     tags=tags,
                 )
             )
+            checkpoint_manifest()
 
             # Wait for instance running state
             logger.info(f"Waiting for instance '{instance_id}' to enter 'running' state...")
@@ -706,6 +764,14 @@ class P05Practical(PracticalContract):
 
         if adapter.mock_mode:
             deleted = [r.resource_id for r in manifest.resources]
+            run_dir = get_run_dir(manifest.run_id)
+            local_token = run_dir / "admin_token"
+            if local_token.is_file():
+                try:
+                    local_token.unlink()
+                    deleted.append(f"local-secret:{local_token}")
+                except Exception:
+                    pass
             return CleanupResult(
                 practical_id="P05",
                 run_id=manifest.run_id,
@@ -714,6 +780,64 @@ class P05Practical(PracticalContract):
                 message=f"Cleaned up {len(deleted)} mock resources.",
             )
 
+        # -----------------------------------------------------------------
+        # Real AWS Cleanup: Enforce strict safety guards before touching AWS
+        # -----------------------------------------------------------------
+
+        # 1. Refuse cleanup on mock manifests when in live execution mode
+        is_mock_manifest = (
+            manifest.aws_account_id == "mock"
+            or manifest.aws_account_id == "mock-123456789012"
+            or "mock" in manifest.aws_account_id.lower()
+            or any("mock" in r.resource_id.lower() or ":i-mock" in (r.arn or "") for r in manifest.resources)
+        )
+        if is_mock_manifest:
+            msg = (
+                f"Cleanup refused: Manifest '{manifest.run_id}' was generated in mock mode. "
+                "Live AWS cleanup will not act on mock manifests."
+            )
+            logger.error(msg)
+            return CleanupResult(
+                practical_id="P05",
+                run_id=manifest.run_id,
+                success=False,
+                resources_deleted=[],
+                errors=[msg],
+            )
+
+        # 2. Refuse cleanup if AWS account or region do not match active identity
+        identity = adapter.get_caller_identity()
+        raw_account = identity.get("Account", "unknown")
+        masked_account = mask_account_id(raw_account)
+        active_region = adapter.region_name
+
+        if manifest.aws_account_id not in (masked_account, raw_account):
+            msg = (
+                f"Cleanup refused: Manifest AWS account '{manifest.aws_account_id}' does not match "
+                f"active caller account '{masked_account}'. Cross-account deletion is prohibited."
+            )
+            logger.error(msg)
+            return CleanupResult(
+                practical_id="P05",
+                run_id=manifest.run_id,
+                success=False,
+                resources_deleted=[],
+                errors=[msg],
+            )
+
+        if manifest.aws_region != active_region:
+            msg = (
+                f"Cleanup refused: Manifest AWS region '{manifest.aws_region}' does not match "
+                f"active target region '{active_region}'. Cross-region deletion is prohibited."
+            )
+            logger.error(msg)
+            return CleanupResult(
+                practical_id="P05",
+                run_id=manifest.run_id,
+                success=False,
+                resources_deleted=[],
+                errors=[msg],
+            )
 
         deleted: List[str] = []
         errors: List[str] = []
@@ -723,7 +847,7 @@ class P05Practical(PracticalContract):
         for r in manifest.resources:
             res_map.setdefault(r.resource_type, []).append(r.resource_id)
 
-        # 1. Clean up EC2 Instance, Security Group, and Key Pair
+        # 1. Clean up EC2 Instance, Security Group, and Key Pair (reverse order: instances first)
         ec2_client = adapter.get_client("ec2")
         instance_ids = res_map.get("ec2-instance", [])
         sg_ids = res_map.get("security-group", [])
@@ -731,33 +855,38 @@ class P05Practical(PracticalContract):
 
         for inst_id in instance_ids:
             try:
-                deleted.extend(cleanup_ec2_resources(ec2_client, instance_id=inst_id))
+                deleted.extend(cleanup_ec2_resources(ec2_client, instance_id=inst_id, expected_run_id=manifest.run_id))
             except Exception as e:
                 errors.append(f"Failed to terminate instance {inst_id}: {e}")
 
         for sg_id in sg_ids:
             try:
-                deleted.extend(cleanup_ec2_resources(ec2_client, security_group_id=sg_id))
+                deleted.extend(cleanup_ec2_resources(ec2_client, security_group_id=sg_id, expected_run_id=manifest.run_id))
             except Exception as e:
                 errors.append(f"Failed to delete security group {sg_id}: {e}")
 
         for k_name in key_names:
             try:
-                deleted.extend(cleanup_ec2_resources(ec2_client, key_name=k_name))
+                deleted.extend(cleanup_ec2_resources(ec2_client, key_name=k_name, expected_run_id=manifest.run_id))
             except Exception as e:
                 errors.append(f"Failed to delete key pair {k_name}: {e}")
 
-        # 2. Clean up IAM Instance Profile and Role
+        # 2. Clean up IAM Instance Profile and Role independently (profiles first, then roles)
         iam_client = adapter.get_client("iam")
         profiles = res_map.get("iam-instance-profile", [])
         roles = res_map.get("iam-role", [])
 
         for prof in profiles:
-            for role in roles:
-                try:
-                    deleted.extend(cleanup_iam_resources(iam_client, role_name=role, profile_name=prof))
-                except Exception as e:
-                    errors.append(f"Failed to delete IAM profile/role {prof}/{role}: {e}")
+            try:
+                deleted.extend(cleanup_iam_resources(iam_client, profile_name=prof, expected_run_id=manifest.run_id))
+            except Exception as e:
+                errors.append(f"Failed to delete IAM profile {prof}: {e}")
+
+        for role in roles:
+            try:
+                deleted.extend(cleanup_iam_resources(iam_client, role_name=role, expected_run_id=manifest.run_id))
+            except Exception as e:
+                errors.append(f"Failed to delete IAM role {role}: {e}")
 
         # 3. Clean up S3 Bucket and Documents
         s3_client = adapter.get_client("s3")
@@ -767,7 +896,7 @@ class P05Practical(PracticalContract):
 
         for b in buckets:
             try:
-                deleted.extend(cleanup_s3_resources(s3_client, bucket_name=b, tracked_object_keys=obj_keys))
+                deleted.extend(cleanup_s3_resources(s3_client, bucket_name=b, tracked_object_keys=obj_keys, expected_run_id=manifest.run_id))
             except Exception as e:
                 errors.append(f"Failed to clean up S3 bucket {b}: {e}")
 
@@ -776,9 +905,20 @@ class P05Practical(PracticalContract):
         tables = res_map.get("dynamodb-table", [])
         for tbl in tables:
             try:
-                deleted.extend(cleanup_dynamodb_resources(dynamodb_client, table_name=tbl))
+                deleted.extend(cleanup_dynamodb_resources(dynamodb_client, table_name=tbl, expected_run_id=manifest.run_id))
             except Exception as e:
                 errors.append(f"Failed to delete DynamoDB table {tbl}: {e}")
+
+        # 5. Clean up local sensitive admin_token file if present
+        run_dir = get_run_dir(manifest.run_id)
+        local_token = run_dir / "admin_token"
+        if local_token.is_file():
+            try:
+                local_token.unlink()
+                deleted.append(f"local-secret:{local_token}")
+                logger.info(f"Removed local admin token file '{local_token}'.")
+            except Exception as e:
+                logger.warning(f"Could not remove local token file '{local_token}': {e}")
 
         return CleanupResult(
             practical_id="P05",

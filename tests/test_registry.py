@@ -1,9 +1,7 @@
 """Unit tests for practical registry and ID normalization."""
 
-import pytest
 
-from cloudprac.core.contract import PracticalContract
-from cloudprac.core.models import PracticalMetadata, PracticalStatus
+from cloudprac.core.models import PracticalStatus
 from cloudprac.core.registry import PracticalRegistry, normalize_practical_id
 
 

@@ -1,7 +1,6 @@
 """Verification engine for evaluating AWS resource state post-execution."""
 
 import json
-from pathlib import Path
 from typing import Any, Optional
 
 from cloudprac.core.contract import PracticalContract, PracticalNotConfiguredError

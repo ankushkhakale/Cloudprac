@@ -1,6 +1,6 @@
 import json
-import sys
 from typing import Any, Optional
+
 import typer
 from rich.console import Console
 
@@ -25,7 +25,7 @@ from cloudprac.core.planner import ExecutionPlanner
 from cloudprac.core.registry import get_registry, normalize_practical_id
 from cloudprac.core.verifier import VerificationEngine
 from cloudprac.reporting.generator import ReportGenerator
-from cloudprac.utils.config import load_config, save_config
+from cloudprac.utils.config import load_config
 from cloudprac.utils.logging import setup_logging
 from cloudprac.utils.paths import get_run_dir
 
@@ -130,7 +130,7 @@ def plan_practical(
     key_name: Optional[str] = typer.Option(None, "--key-name", "-k", help="EC2 key pair name override."),
     ssh_cidr: Optional[str] = typer.Option(None, "--ssh-cidr", help="Allowed IPv4 CIDR range for SSH ingress."),
     app_port: Optional[int] = typer.Option(None, "--app-port", "--port", help="Port for web application (default 5000)."),
-    app_cidr: Optional[str] = typer.Option(None, "--app-cidr", help="Allowed IPv4 CIDR range for web application access."),
+    app_cidr: Optional[str] = typer.Option(None, "--app-cidr", "--cidr", help="Allowed IPv4 CIDR range for web application access."),
 ) -> None:
     """Generate a dry-run execution plan without modifying any AWS resources."""
     registry = get_registry()
@@ -178,7 +178,7 @@ def run_practical(
     key_name: Optional[str] = typer.Option(None, "--key-name", "-k", help="EC2 Key pair name override."),
     ssh_cidr: Optional[str] = typer.Option(None, "--ssh-cidr", help="Allowed IPv4 CIDR range for SSH ingress."),
     app_port: Optional[int] = typer.Option(None, "--app-port", "--port", help="Port for web application (default 5000)."),
-    app_cidr: Optional[str] = typer.Option(None, "--app-cidr", help="Allowed IPv4 CIDR range for web application access."),
+    app_cidr: Optional[str] = typer.Option(None, "--app-cidr", "--cidr", help="Allowed IPv4 CIDR range for web application access."),
 ) -> None:
     """Safely execute a practical's AWS operations."""
     registry = get_registry()
@@ -247,7 +247,7 @@ def run_practical(
 
 @app.command("verify")
 def verify_practical(
-    practical_id: str = typer.Argument(..., help="Practical ID (e.g. P01, 1)"),
+    practical_id: str = typer.Argument(..., help="Practical ID (e.g. P05, 5)"),
     run_id: Optional[str] = typer.Option(None, "--run-id", help="Specific run ID to verify against."),
     region: Optional[str] = typer.Option(None, "--region", "-r", help="Target AWS region override."),
     profile: Optional[str] = typer.Option(None, "--profile", "-p", help="AWS CLI profile name."),
@@ -350,7 +350,7 @@ def cleanup_practical(
         console.print(f"[dim]Could not preview manifest: {e}[/dim]")
 
     if not yes:
-        confirmed = typer.confirm(f"Are you sure you want to clean up these resources from AWS?")
+        confirmed = typer.confirm("Are you sure you want to clean up these resources from AWS?")
         if not confirmed:
             console.print("[dim]Cleanup cancelled. Resources were retained.[/dim]")
             raise typer.Exit(0)

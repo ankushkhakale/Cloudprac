@@ -1,6 +1,7 @@
 """Unit tests for configuration loading and validation."""
 
 from pathlib import Path
+
 from cloudprac.utils.config import CloudPracConfig, load_config, save_config
 
 
