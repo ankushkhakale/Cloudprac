@@ -966,3 +966,227 @@ def test_p05_execution_failure_persists_instance_to_manifest_and_allows_cleanup(
             cleanup_result = practical.cleanup(manifest_obj, mock_adapter)
 
     assert "ec2-instance:i-manifestpersist" in cleanup_result.resources_deleted
+
+
+# ==============================================================================
+# 13. Empty Reservations / Instances Handling in Cleanup and Public IP Polling
+# ==============================================================================
+
+
+def test_cleanup_ec2_handles_empty_reservations_when_already_absent_without_index_error(tmp_path):
+    """
+    Regression test for:
+      Cleanup fails with 'list index out of range' when DescribeInstances returns
+      empty Reservations (instance does not exist or was never created).
+    """
+    from cloudprac.adapters.aws_client import AWSAdapter
+    from cloudprac.core.models import RunManifest, TrackedResource
+    from cloudprac.practicals.p05.practical import P05Practical
+
+    practical = P05Practical()
+    mock_adapter = MagicMock(spec=AWSAdapter)
+    mock_adapter.mock_mode = False
+    mock_adapter.region_name = "ap-south-1"
+    mock_adapter.get_caller_identity.return_value = {"Account": "123456789012"}
+
+    mock_ec2 = MagicMock()
+    mock_adapter.get_client.side_effect = lambda service, **kwargs: {
+        "ec2": mock_ec2,
+    }.get(service, MagicMock())
+
+    run_id = "P05-20261010-183146-05faba"
+    manifest = RunManifest(
+        practical_id="P05",
+        run_id=run_id,
+        aws_region="ap-south-1",
+        aws_account_id="1234****9012",
+        resources=[
+            TrackedResource(
+                resource_type="ec2-instance",
+                resource_id="i-05faba123456789ab",
+                resource_name=f"cloudprac-p05-app-{run_id}",
+            )
+        ],
+    )
+
+    # DescribeInstances returns empty Reservations (instance absent)
+    mock_ec2.describe_instances.return_value = {"Reservations": []}
+
+    with patch("cloudprac.practicals.p05.practical.get_run_dir", return_value=tmp_path / run_id):
+        with patch("time.sleep", return_value=None):
+            result = practical.cleanup(manifest, mock_adapter)
+
+    # Must NOT crash with IndexError: list index out of range
+    assert result.success is True
+    assert "ec2-instance:i-05faba123456789ab" in result.resources_absent
+    assert len(result.errors) == 0
+
+
+def test_wait_for_instance_running_extracts_public_ip_from_network_interfaces():
+    """
+    When top-level PublicIpAddress is missing or empty, wait_for_instance_running
+    must extract the public IP from NetworkInterfaces[0].Association.PublicIp.
+    """
+    from cloudprac.practicals.p05.ec2 import wait_for_instance_running
+
+    mock_ec2 = MagicMock()
+    mock_ec2.describe_instances.return_value = {
+        "Reservations": [
+            {
+                "Instances": [
+                    {
+                        "InstanceId": "i-eniip123",
+                        "State": {"Name": "running"},
+                        "PublicIpAddress": "",  # Empty top-level
+                        "NetworkInterfaces": [
+                            {
+                                "DeviceIndex": 0,
+                                "Association": {
+                                    "PublicIp": "13.235.45.67",
+                                },
+                            }
+                        ],
+                    }
+                ]
+            }
+        ]
+    }
+
+    with patch("time.sleep", return_value=None):
+        instance = wait_for_instance_running(mock_ec2, "i-eniip123", max_timeout=30)
+
+    assert instance["PublicIpAddress"] == "13.235.45.67"
+
+
+def test_wait_for_instance_running_polls_until_public_ip_assigned():
+    """
+    When require_public_ip=True, wait_for_instance_running must poll through
+    'running without IP' until the public IP appears.
+    """
+    from cloudprac.practicals.p05.ec2 import wait_for_instance_running
+
+    mock_ec2 = MagicMock()
+    # Cycle 1: running but no IP yet
+    cycle1 = {
+        "Reservations": [
+            {
+                "Instances": [
+                    {
+                        "InstanceId": "i-delayedip",
+                        "State": {"Name": "running"},
+                        "PublicIpAddress": None,
+                    }
+                ]
+            }
+        ]
+    }
+    # Cycle 2: running with public IP populated
+    cycle2 = {
+        "Reservations": [
+            {
+                "Instances": [
+                    {
+                        "InstanceId": "i-delayedip",
+                        "State": {"Name": "running"},
+                        "PublicIpAddress": "13.235.99.11",
+                    }
+                ]
+            }
+        ]
+    }
+    mock_ec2.describe_instances.side_effect = [cycle1, cycle2]
+
+    with patch("time.sleep", return_value=None):
+        instance = wait_for_instance_running(
+            mock_ec2,
+            "i-delayedip",
+            max_timeout=30,
+            require_public_ip=True,
+        )
+
+    assert instance["PublicIpAddress"] == "13.235.99.11"
+    assert mock_ec2.describe_instances.call_count == 2
+
+
+def test_p05_includes_name_tag_and_respects_aws_region_env(monkeypatch, tmp_path):
+    """
+    Verify that P05:
+    1. Resolves region from AWS_REGION (e.g. ap-south-1 in CloudShell) rather than default us-east-1.
+    2. Tags the EC2 instance with 'Name': 'cloudprac-p05-app-<clean_run>' so it matches console filters.
+    """
+    monkeypatch.setenv("AWS_REGION", "ap-south-1")
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+
+    from cloudprac.adapters.aws_client import AWSAdapter
+    from cloudprac.practicals.p05.practical import P05Practical
+    from cloudprac.utils.config import CloudPracConfig
+
+    config = CloudPracConfig()
+    practical = P05Practical()
+    practical.p05_config.app_cidr = "192.0.2.1/32"
+
+    # 1. Plan must resolve to ap-south-1
+    plan = practical.plan(config, "test-mumbai-001")
+    assert plan.aws_region == "ap-south-1"
+
+    # 2. Execution must tag with Name and use ap-south-1
+    mock_adapter = MagicMock(spec=AWSAdapter)
+    mock_adapter.mock_mode = False
+    mock_adapter.region_name = "ap-south-1"
+    mock_adapter.get_caller_identity.return_value = {"Account": "123456789012"}
+
+    mock_s3 = MagicMock()
+    mock_dynamodb = MagicMock()
+    mock_iam = MagicMock()
+    mock_ec2 = MagicMock()
+
+    mock_adapter.get_client.side_effect = lambda service, **kwargs: {
+        "s3": mock_s3,
+        "dynamodb": mock_dynamodb,
+        "iam": mock_iam,
+        "ec2": mock_ec2,
+    }.get(service, MagicMock())
+
+    mock_dynamodb.describe_table.return_value = {"Table": {"TableStatus": "ACTIVE"}}
+    mock_ec2.describe_subnets.return_value = {
+        "Subnets": [{"SubnetId": "subnet-mumbai", "VpcId": "vpc-mumbai"}]
+    }
+    mock_ec2.create_security_group.return_value = {"GroupId": "sg-mumbai"}
+    mock_ec2.describe_images.return_value = {"Images": [{"ImageId": "ami-mumbai"}]}
+    mock_ec2.create_key_pair.return_value = {"KeyMaterial": "fake", "KeyName": "key-mumbai"}
+    mock_ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-mumbai123"}]}
+    mock_ec2.describe_instances.return_value = {
+        "Reservations": [
+            {
+                "Instances": [
+                    {
+                        "InstanceId": "i-mumbai123",
+                        "State": {"Name": "running"},
+                        "PublicIpAddress": "13.235.1.2",
+                    }
+                ]
+            }
+        ]
+    }
+
+    with patch(
+        "cloudprac.practicals.p05.practical.get_run_dir", return_value=tmp_path / "test-mumbai-001"
+    ):
+        with patch("cloudprac.practicals.p05.practical.save_restricted_file"):
+            with patch(
+                "cloudprac.practicals.p05.practical.check_application_health",
+                return_value=(True, "OK"),
+            ):
+                with patch("time.sleep", return_value=None):
+                    result = practical.execute(plan, mock_adapter)
+
+    assert result.success is True
+    # Confirm RunInstances received Name tag
+    call_kwargs = mock_ec2.run_instances.call_args[1]
+    tag_specs = call_kwargs.get("TagSpecifications", [])
+    instance_tags = next(
+        (ts["Tags"] for ts in tag_specs if ts.get("ResourceType") == "instance"), []
+    )
+    name_tag = next((t["Value"] for t in instance_tags if t.get("Key") == "Name"), None)
+    assert name_tag is not None
+    assert "cloudprac-p05-app-" in name_tag

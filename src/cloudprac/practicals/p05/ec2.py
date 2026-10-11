@@ -53,9 +53,7 @@ def get_default_or_first_vpc(ec2_client: Any) -> Tuple[str, str]:
     for explicitly requesting a public IP at launch time.
     """
     try:
-        vpcs_resp = ec2_client.describe_vpcs(
-            Filters=[{"Name": "isDefault", "Values": ["true"]}]
-        )
+        vpcs_resp = ec2_client.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])
         vpcs = vpcs_resp.get("Vpcs", [])
         if not vpcs:
             all_vpcs_resp = ec2_client.describe_vpcs()
@@ -69,9 +67,7 @@ def get_default_or_first_vpc(ec2_client: Any) -> Tuple[str, str]:
 
         vpc_id = vpcs[0]["VpcId"]
 
-        subnets_resp = ec2_client.describe_subnets(
-            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
-        )
+        subnets_resp = ec2_client.describe_subnets(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])
         subnets = subnets_resp.get("Subnets", [])
         if not subnets:
             raise RuntimeError(
@@ -82,7 +78,9 @@ def get_default_or_first_vpc(ec2_client: Any) -> Tuple[str, str]:
         public_subnets = [s for s in subnets if s.get("MapPublicIpOnLaunch", False)]
         if public_subnets:
             subnet_id = public_subnets[0]["SubnetId"]
-            logger.debug(f"Selected public subnet '{subnet_id}' (MapPublicIpOnLaunch=True) in VPC '{vpc_id}'.")
+            logger.debug(
+                f"Selected public subnet '{subnet_id}' (MapPublicIpOnLaunch=True) in VPC '{vpc_id}'."
+            )
         else:
             subnet_id = subnets[0]["SubnetId"]
             logger.warning(
@@ -97,18 +95,23 @@ def get_default_or_first_vpc(ec2_client: Any) -> Tuple[str, str]:
         raise
 
 
-
-def find_latest_al2023_ami(ec2_client: Any, ssm_client: Optional[Any] = None, architecture: str = "x86_64") -> str:
+def find_latest_al2023_ami(
+    ec2_client: Any, ssm_client: Optional[Any] = None, architecture: str = "x86_64"
+) -> str:
     """Discover the latest available Amazon Linux 2023 AMI without hard-coding."""
     if ssm_client:
         try:
-            param_name = f"/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-{architecture}"
+            param_name = (
+                f"/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-{architecture}"
+            )
             resp = ssm_client.get_parameter(Name=param_name)
             ami_id = resp.get("Parameter", {}).get("Value")
             if ami_id and ami_id.startswith("ami-"):
                 return ami_id
         except Exception as e:
-            logger.debug(f"SSM AMI lookup failed or not permitted, falling back to DescribeImages: {e}")
+            logger.debug(
+                f"SSM AMI lookup failed or not permitted, falling back to DescribeImages: {e}"
+            )
 
     try:
         images_resp = ec2_client.describe_images(
@@ -189,13 +192,18 @@ def setup_security_group(
                     "ResourceType": "security-group",
                     "Tags": tag_list,
                 }
-            ] if tag_list else [],
+            ]
+            if tag_list
+            else [],
         )
         sg_id = sg_resp["GroupId"]
     except ClientError as e:
         if e.response.get("Error", {}).get("Code") == "InvalidGroup.Duplicate":
             existing = ec2_client.describe_security_groups(
-                Filters=[{"Name": "group-name", "Values": [group_name]}, {"Name": "vpc-id", "Values": [vpc_id]}]
+                Filters=[
+                    {"Name": "group-name", "Values": [group_name]},
+                    {"Name": "vpc-id", "Values": [vpc_id]},
+                ]
             )
             sg_id = existing["SecurityGroups"][0]["GroupId"]
         else:
@@ -212,7 +220,12 @@ def setup_security_group(
                     "IpProtocol": "tcp",
                     "FromPort": app_port,
                     "ToPort": app_port,
-                    "IpRanges": [{"CidrIp": target_app_cidr, "Description": f"CloudPrac P05 Web App (Port {app_port})"}],
+                    "IpRanges": [
+                        {
+                            "CidrIp": target_app_cidr,
+                            "Description": f"CloudPrac P05 Web App (Port {app_port})",
+                        }
+                    ],
                 }
             ],
         )
@@ -231,7 +244,9 @@ def setup_security_group(
                         "IpProtocol": "tcp",
                         "FromPort": 22,
                         "ToPort": 22,
-                        "IpRanges": [{"CidrIp": target_ssh_cidr, "Description": "CloudPrac SSH Access"}],
+                        "IpRanges": [
+                            {"CidrIp": target_ssh_cidr, "Description": "CloudPrac SSH Access"}
+                        ],
                     }
                 ],
             )
@@ -485,7 +500,6 @@ echo "=== CloudPrac P05 Bootstrap Complete. Service running on port {app_port} =
     return script
 
 
-
 def launch_ec2_instance(
     ec2_client: Any,
     image_id: str,
@@ -586,6 +600,23 @@ def launch_ec2_instance(
             raise
 
 
+def extract_instance_public_ip(instance: Dict[str, Any]) -> str:
+    """Extract public IPv4 address from instance top-level attribute or primary ENI association."""
+    if not isinstance(instance, dict):
+        return ""
+    pub_ip = instance.get("PublicIpAddress")
+    if pub_ip and str(pub_ip).strip():
+        return str(pub_ip).strip()
+    for eni in instance.get("NetworkInterfaces", []):
+        if not isinstance(eni, dict):
+            continue
+        assoc = eni.get("Association") or {}
+        ip = assoc.get("PublicIp")
+        if ip and str(ip).strip():
+            return str(ip).strip()
+    return ""
+
+
 def wait_for_instance_running(
     ec2_client: Any,
     instance_id: str,
@@ -593,6 +624,8 @@ def wait_for_instance_running(
     region: Optional[str] = None,
     account_id: Optional[str] = None,
     max_not_found_attempts: int = 8,
+    require_public_ip: bool = False,
+    max_public_ip_wait: int = 30,
 ) -> Dict[str, Any]:
     """Poll until instance enters 'running' state or timeout is reached.
 
@@ -601,6 +634,10 @@ def wait_for_instance_running(
     returns the ID.  This is expected eventual-consistency behaviour, not a sign
     that the launch failed.  We treat it as a transient condition and retry with
     a bounded attempt threshold (*max_not_found_attempts*), logging each occurrence.
+
+    If *require_public_ip* is True, polling continues briefly while the instance is
+    in 'running' state until a public IPv4 address is assigned and visible on either
+    the instance or its primary network interface.
 
     If the instance does not exist in the targeted region or was never created,
     polling fails with a descriptive error message stating the instance ID,
@@ -627,6 +664,7 @@ def wait_for_instance_running(
     not_found_count = 0
     ever_found = False
     last_state = "unknown"
+    running_since: Optional[float] = None
     _NOT_FOUND_CODES = frozenset({"InvalidInstanceID.NotFound", "InvalidInstanceID.Malformed"})
 
     while time.time() - start_time < max_timeout:
@@ -640,7 +678,24 @@ def wait_for_instance_running(
                 state = instance.get("State", {}).get("Name", "")
                 last_state = state
                 if state == "running":
-                    return instance
+                    pub_ip = extract_instance_public_ip(instance)
+                    if pub_ip:
+                        instance["PublicIpAddress"] = pub_ip
+                        return instance
+                    if not require_public_ip:
+                        return instance
+                    if running_since is None:
+                        running_since = time.time()
+                    if time.time() - running_since >= max_public_ip_wait:
+                        logger.warning(
+                            f"Instance {instance_id} reached 'running' state {int(time.time() - running_since)}s ago "
+                            "but no public IPv4 address has been assigned yet."
+                        )
+                        return instance
+                    logger.info(
+                        f"Instance {instance_id} is running; waiting for public IPv4 assignment "
+                        f"({int(time.time() - running_since)}s elapsed)..."
+                    )
                 if state in ("terminated", "shutting-down"):
                     raise RuntimeError(
                         f"EC2 instance {instance_id} unexpectedly entered '{state}' state while waiting. "
@@ -691,7 +746,6 @@ def wait_for_instance_running(
     )
 
 
-
 def check_application_health(
     public_ip: str,
     app_port: int = 5000,
@@ -703,7 +757,10 @@ def check_application_health(
     Explains why an instance being 'running' does NOT prove that its application is working.
     """
     if not public_ip:
-        return False, "No public IP assigned to EC2 instance; cannot probe application health externally."
+        return (
+            False,
+            "No public IP assigned to EC2 instance; cannot probe application health externally.",
+        )
 
     health_url = f"http://{public_ip}:{app_port}/health"
     logger.info(f"Checking application health at {health_url}...")
@@ -711,13 +768,17 @@ def check_application_health(
 
     while time.time() - start_time < max_timeout:
         try:
-            req = urllib.request.Request(health_url, headers={"User-Agent": "CloudPrac-HealthCheck"})
+            req = urllib.request.Request(
+                health_url, headers={"User-Agent": "CloudPrac-HealthCheck"}
+            )
             with urllib.request.urlopen(req, timeout=4) as response:
                 if response.status == 200:
                     body = response.read().decode("utf-8")
                     return True, f"Application healthy (HTTP 200). Response: {body}"
         except Exception as e:
-            logger.debug(f"Application endpoint not yet ready ({e}), retrying in {poll_interval}s...")
+            logger.debug(
+                f"Application endpoint not yet ready ({e}), retrying in {poll_interval}s..."
+            )
         time.sleep(poll_interval)
 
     return False, (
@@ -795,7 +856,9 @@ def verify_ec2_instance(
                     description="Verify least-privilege IAM profile is attached",
                     passed=profile_matched,
                     expected=f"Instance profile containing '{expected_profile_name}' attached",
-                    actual=f"Attached profile ARN: '{profile_arn}'" if profile_arn else "No IAM instance profile attached",
+                    actual=f"Attached profile ARN: '{profile_arn}'"
+                    if profile_arn
+                    else "No IAM instance profile attached",
                 )
             )
 
@@ -823,7 +886,6 @@ def verify_ec2_instance(
                 actual=f"Error querying instance: {e}",
             )
         )
-
 
     return checks
 
@@ -858,7 +920,10 @@ def cleanup_ec2_resources(
                             should_terminate = False
                         else:
                             tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
-                            is_owned = tags.get("ManagedBy") == "CloudPrac" and tags.get("RunId") == expected_run_id
+                            is_owned = (
+                                tags.get("ManagedBy") == "CloudPrac"
+                                and tags.get("RunId") == expected_run_id
+                            )
                             if not is_owned:
                                 logger.error(
                                     f"Ownership check failed for EC2 instance '{instance_id}': "
@@ -869,7 +934,10 @@ def cleanup_ec2_resources(
                     else:
                         should_terminate = False
                 except ClientError as e:
-                    if e.response.get("Error", {}).get("Code") in ("InvalidInstanceID.NotFound", "InvalidInstanceID.Malformed"):
+                    if e.response.get("Error", {}).get("Code") in (
+                        "InvalidInstanceID.NotFound",
+                        "InvalidInstanceID.Malformed",
+                    ):
                         logger.info(f"EC2 instance '{instance_id}' not found. Already cleaned up.")
                         should_terminate = False
                     else:
@@ -916,7 +984,10 @@ def cleanup_ec2_resources(
                     sgs = sg_desc.get("SecurityGroups", [])
                     if sgs:
                         tags = {t["Key"]: t["Value"] for t in sgs[0].get("Tags", [])}
-                        is_owned = tags.get("ManagedBy") == "CloudPrac" and tags.get("RunId") == expected_run_id
+                        is_owned = (
+                            tags.get("ManagedBy") == "CloudPrac"
+                            and tags.get("RunId") == expected_run_id
+                        )
                         if not is_owned:
                             logger.error(
                                 f"Ownership check failed for Security Group '{security_group_id}': "
@@ -927,8 +998,13 @@ def cleanup_ec2_resources(
                     else:
                         should_delete_sg = False
                 except ClientError as e:
-                    if e.response.get("Error", {}).get("Code") in ("InvalidGroup.NotFound", "InvalidGroupId.Malformed"):
-                        logger.info(f"Security group '{security_group_id}' not found. Already cleaned up.")
+                    if e.response.get("Error", {}).get("Code") in (
+                        "InvalidGroup.NotFound",
+                        "InvalidGroupId.Malformed",
+                    ):
+                        logger.info(
+                            f"Security group '{security_group_id}' not found. Already cleaned up."
+                        )
                         should_delete_sg = False
                     else:
                         logger.error(
@@ -970,11 +1046,16 @@ def cleanup_ec2_resources(
             should_delete_kp = True
             if expected_run_id:
                 try:
-                    kp_desc = ec2_client.describe_key_pairs(KeyNames=[key_name], IncludePublicKey=False)
+                    kp_desc = ec2_client.describe_key_pairs(
+                        KeyNames=[key_name], IncludePublicKey=False
+                    )
                     kps = kp_desc.get("KeyPairs", [])
                     if kps:
                         tags = {t["Key"]: t["Value"] for t in kps[0].get("Tags", [])}
-                        is_owned = tags.get("ManagedBy") == "CloudPrac" and tags.get("RunId") == expected_run_id
+                        is_owned = (
+                            tags.get("ManagedBy") == "CloudPrac"
+                            and tags.get("RunId") == expected_run_id
+                        )
                         if not is_owned:
                             logger.error(
                                 f"Ownership check failed for Key Pair '{key_name}': "
@@ -985,7 +1066,10 @@ def cleanup_ec2_resources(
                     else:
                         should_delete_kp = False
                 except ClientError as e:
-                    if e.response.get("Error", {}).get("Code") in ("InvalidKeyPair.NotFound", "InvalidKeyPair.Duplicate"):
+                    if e.response.get("Error", {}).get("Code") in (
+                        "InvalidKeyPair.NotFound",
+                        "InvalidKeyPair.Duplicate",
+                    ):
                         logger.info(f"Key pair '{key_name}' not found. Already cleaned up.")
                         should_delete_kp = False
                     else:

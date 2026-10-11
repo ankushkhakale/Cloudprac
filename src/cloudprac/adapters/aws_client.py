@@ -20,20 +20,21 @@ def mask_account_id(account_id: str) -> str:
     return "********"
 
 
-def resolve_region(explicit: Optional[str] = None) -> str:
+def resolve_region(explicit: Optional[str] = None, fallback: Optional[str] = None) -> str:
     """Resolve the AWS region using a consistent, ordered priority chain.
 
     Priority (highest to lowest):
     1. Caller-supplied *explicit* value (e.g. from --region CLI flag or P05Config.region).
     2. ``AWS_REGION`` environment variable (set by CloudShell and most SDKs).
     3. ``AWS_DEFAULT_REGION`` environment variable (boto3 / CLI convention).
-    4. Hard-coded fallback: ``us-east-1``.
+    4. Saved config or hard-coded fallback: ``us-east-1``.
     """
     if explicit:
         return explicit
     return (
         os.environ.get("AWS_REGION")
         or os.environ.get("AWS_DEFAULT_REGION")
+        or fallback
         or _DEFAULT_REGION
     )
 
@@ -50,7 +51,8 @@ class AWSAdapter:
         self._region = resolve_region(region_name)
         self._profile = profile_name or os.environ.get("AWS_PROFILE")
         self._mock_mode = (
-            mock_mode if mock_mode is not None
+            mock_mode
+            if mock_mode is not None
             else os.environ.get(ENV_MOCK_AWS, "0").lower() in ("1", "true", "yes")
         )
         self._session: Optional[boto3.Session] = None
@@ -69,7 +71,6 @@ class AWSAdapter:
     def region_name(self) -> str:
         """Alias for region."""
         return self._region
-
 
     @property
     def profile(self) -> Optional[str]:

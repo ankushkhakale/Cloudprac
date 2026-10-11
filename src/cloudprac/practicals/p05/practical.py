@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 from botocore.exceptions import ClientError
 
-from cloudprac.adapters.aws_client import AWSAdapter, mask_account_id
+from cloudprac.adapters.aws_client import AWSAdapter, mask_account_id, resolve_region
 from cloudprac.core.contract import PracticalContract
 from cloudprac.core.models import (
     CleanupResult,
@@ -34,6 +34,7 @@ from cloudprac.practicals.p05.ec2 import (
     build_user_data_script,
     check_application_health,
     cleanup_ec2_resources,
+    extract_instance_public_ip,
     find_latest_al2023_ami,
     get_default_or_first_vpc,
     launch_ec2_instance,
@@ -75,7 +76,6 @@ def sanitize_name(raw_name: str) -> str:
 def _is_mock_client(client: Any) -> bool:
     """Detect whether client is a unit test Mock object."""
     return isinstance(client, Mock) or hasattr(client, "_mock_return_value")
-
 
 
 class P05Practical(PracticalContract):
@@ -206,7 +206,9 @@ class P05Practical(PracticalContract):
             ),
         ]
 
-        target_region = self.p05_config.region or getattr(config, "default_region", "us-east-1")
+        target_region = resolve_region(
+            self.p05_config.region, fallback=getattr(config, "default_region", "us-east-1")
+        )
         return ExecutionPlan(
             practical_id="P05",
             run_id=run_id,
@@ -223,12 +225,16 @@ class P05Practical(PracticalContract):
 
     def execute(self, plan: ExecutionPlan, context: Any) -> ExecutionResult:
         """Execute the planned AWS provisioning sequence safely."""
-        adapter: AWSAdapter = context if isinstance(context, AWSAdapter) else getattr(context, "adapter", None)
+        adapter: AWSAdapter = (
+            context if isinstance(context, AWSAdapter) else getattr(context, "adapter", None)
+        )
         if not adapter:
             raise RuntimeError("Execution context missing valid AWSAdapter.")
 
         clean_run = sanitize_name(plan.run_id)
-        region = plan.aws_region or self.p05_config.region or adapter.region_name
+        region = resolve_region(
+            self.p05_config.region or plan.aws_region, fallback=adapter.region_name
+        )
         identity = adapter.get_caller_identity()
         raw_account = identity.get("Account", "unknown")
         account_id = mask_account_id(raw_account).replace("*", "x")
@@ -244,6 +250,7 @@ class P05Practical(PracticalContract):
             "ManagedBy": "CloudPrac",
             "PracticalId": "P05",
             "RunId": plan.run_id,
+            "Name": f"cloudprac-p05-app-{clean_run}",
         }
 
         if adapter.mock_mode:
@@ -305,6 +312,7 @@ class P05Practical(PracticalContract):
             run_dir = get_run_dir(plan.run_id)
             run_dir.mkdir(parents=True, exist_ok=True)
             import secrets
+
             mock_token = secrets.token_urlsafe(32)
             save_restricted_file(run_dir / "admin_token", mock_token)
             manifest_path = run_dir / "manifest.json"
@@ -334,7 +342,11 @@ class P05Practical(PracticalContract):
         public_ip = ""
 
         # Validate explicit restricted CIDR before any cloud resource provisioning
-        if not self.p05_config.app_cidr or self.p05_config.app_cidr.strip() in ("0.0.0.0/0", "::/0") or self.p05_config.app_cidr.strip().endswith("/0"):
+        if (
+            not self.p05_config.app_cidr
+            or self.p05_config.app_cidr.strip() in ("0.0.0.0/0", "::/0")
+            or self.p05_config.app_cidr.strip().endswith("/0")
+        ):
             raise ValueError(
                 f"Execution halted: Opening application port {self.p05_config.app_port} to the public internet or an unspecified CIDR is prohibited to protect student records. "
                 "Provide an explicit restricted CIDR via --app-cidr (e.g. --app-cidr <your-ip>/32 or your VPC CIDR)."
@@ -398,6 +410,7 @@ class P05Practical(PracticalContract):
 
             # Generate and securely store unique admin token in private S3 bucket
             import secrets
+
             admin_token = secrets.token_urlsafe(32)
             token_s3_key = f"secrets/{plan.run_id}/admin_token"
             upload_document_to_s3(
@@ -502,7 +515,9 @@ class P05Practical(PracticalContract):
             )
             checkpoint_manifest()
         except Exception as e:
-            logger.warning(f"IAM provisioning encountered issues (continuing with degraded role binding if restricted): {e}")
+            logger.warning(
+                f"IAM provisioning encountered issues (continuing with degraded role binding if restricted): {e}"
+            )
             errors.append(f"IAM Notice: {e}")
 
         # ---------------------------------------------------------
@@ -604,18 +619,23 @@ class P05Practical(PracticalContract):
                 instance_id,
                 region=region,
                 account_id=raw_account,
+                require_public_ip=True,
             )
-            public_ip = inst_data.get("PublicIpAddress", "")
+            public_ip = extract_instance_public_ip(inst_data)
 
             # Validate real public IP
             is_real, ip_reason = is_real_public_ip(public_ip)
             if not is_real:
-                logger.warning(f"EC2 instance '{instance_id}' does not have a valid public IP: {ip_reason}")
+                logger.warning(
+                    f"EC2 instance '{instance_id}' does not have a valid public IP: {ip_reason}"
+                )
                 errors.append(f"EC2 Public IP: {ip_reason}")
             else:
                 logger.info(f"EC2 instance is running at public IP: {public_ip}")
                 # Verify application readiness before reporting success or generating preview URL
-                logger.info(f"Verifying application readiness at http://{public_ip}:{self.p05_config.app_port}/health...")
+                logger.info(
+                    f"Verifying application readiness at http://{public_ip}:{self.p05_config.app_port}/health..."
+                )
                 app_ready, health_detail = check_application_health(
                     public_ip=public_ip,
                     app_port=self.p05_config.app_port,
@@ -679,10 +699,11 @@ class P05Practical(PracticalContract):
             outputs=outputs,
         )
 
-
     def verify(self, run_id: str, context: Any) -> VerificationResult:
         """Perform independent verification on AWS resources and deployed student application."""
-        adapter: AWSAdapter = context if isinstance(context, AWSAdapter) else getattr(context, "adapter", None)
+        adapter: AWSAdapter = (
+            context if isinstance(context, AWSAdapter) else getattr(context, "adapter", None)
+        )
         if not adapter:
             raise RuntimeError("Verification context missing valid AWSAdapter.")
 
@@ -775,14 +796,34 @@ class P05Practical(PracticalContract):
             )
 
         clean_run = sanitize_name(run_id)
-        bucket_res = next((r for r in manifest_data.resources if r.resource_type == "s3-bucket"), None)
-        table_res = next((r for r in manifest_data.resources if r.resource_type == "dynamodb-table"), None)
-        profile_res = next((r for r in manifest_data.resources if r.resource_type == "iam-instance-profile"), None)
-        inst_res = next((r for r in manifest_data.resources if r.resource_type == "ec2-instance"), None)
+        bucket_res = next(
+            (r for r in manifest_data.resources if r.resource_type == "s3-bucket"), None
+        )
+        table_res = next(
+            (r for r in manifest_data.resources if r.resource_type == "dynamodb-table"), None
+        )
+        profile_res = next(
+            (r for r in manifest_data.resources if r.resource_type == "iam-instance-profile"), None
+        )
+        inst_res = next(
+            (r for r in manifest_data.resources if r.resource_type == "ec2-instance"), None
+        )
 
-        bucket_name = bucket_res.resource_id if bucket_res else (self.p05_config.bucket_name or f"cloudprac-p05-{clean_run}")
-        table_name = table_res.resource_id if table_res else (self.p05_config.table_name or f"cloudprac-p05-students-{clean_run}")
-        profile_name = profile_res.resource_id if profile_res else (self.p05_config.iam_profile_name or f"cloudprac-p05-profile-{clean_run}")
+        bucket_name = (
+            bucket_res.resource_id
+            if bucket_res
+            else (self.p05_config.bucket_name or f"cloudprac-p05-{clean_run}")
+        )
+        table_name = (
+            table_res.resource_id
+            if table_res
+            else (self.p05_config.table_name or f"cloudprac-p05-students-{clean_run}")
+        )
+        profile_name = (
+            profile_res.resource_id
+            if profile_res
+            else (self.p05_config.iam_profile_name or f"cloudprac-p05-profile-{clean_run}")
+        )
         instance_id = inst_res.resource_id if inst_res else None
 
         all_checks: List[VerificationCheck] = []
@@ -848,9 +889,9 @@ class P05Practical(PracticalContract):
             )
             try:
                 desc = ec2_client.describe_instances(InstanceIds=[instance_id])
-                resvs = desc.get("Reservations", [])
+                resvs = desc.get("Reservations", []) if isinstance(desc, dict) else []
                 if resvs and resvs[0].get("Instances"):
-                    public_ip = resvs[0]["Instances"][0].get("PublicIpAddress")
+                    public_ip = extract_instance_public_ip(resvs[0]["Instances"][0])
             except Exception:
                 pass
 
@@ -858,7 +899,9 @@ class P05Practical(PracticalContract):
         # Part B: Application & Web Preview Verification Checks
         # -------------------------------------------------------------
         token_file = run_dir / "admin_token"
-        admin_token = token_file.read_text(encoding="utf-8").strip() if token_file.is_file() else None
+        admin_token = (
+            token_file.read_text(encoding="utf-8").strip() if token_file.is_file() else None
+        )
 
         app_checks = verify_application_and_preview(
             public_ip=public_ip,
@@ -881,7 +924,9 @@ class P05Practical(PracticalContract):
 
     def cleanup(self, manifest: RunManifest, context: Any) -> CleanupResult:
         """Tear down only the AWS resources tracked in the run manifest in reverse dependency order."""
-        adapter: AWSAdapter = context if isinstance(context, AWSAdapter) else getattr(context, "adapter", None)
+        adapter: AWSAdapter = (
+            context if isinstance(context, AWSAdapter) else getattr(context, "adapter", None)
+        )
         if not adapter:
             raise RuntimeError("Cleanup context missing valid AWSAdapter.")
 
@@ -915,7 +960,10 @@ class P05Practical(PracticalContract):
             manifest.aws_account_id == "mock"
             or manifest.aws_account_id == "mock-123456789012"
             or "mock" in manifest.aws_account_id.lower()
-            or any("mock" in r.resource_id.lower() or ":i-mock" in (r.arn or "") for r in manifest.resources)
+            or any(
+                "mock" in r.resource_id.lower() or ":i-mock" in (r.arn or "")
+                for r in manifest.resources
+            )
         )
         if is_mock_manifest:
             msg = (
@@ -992,7 +1040,9 @@ class P05Practical(PracticalContract):
         instance_ids = res_map.get("ec2-instance", [])
         for inst_id in instance_ids:
             try:
-                term_res = cleanup_ec2_resources(ec2_client, instance_id=inst_id, expected_run_id=manifest.run_id)
+                term_res = cleanup_ec2_resources(
+                    ec2_client, instance_id=inst_id, expected_run_id=manifest.run_id
+                )
                 if term_res:
                     if _is_mock_client(ec2_client):
                         resources_deleted.append(f"ec2-instance:{inst_id}")
@@ -1000,13 +1050,26 @@ class P05Practical(PracticalContract):
                         # Independent verification of terminal state in live AWS
                         try:
                             desc = ec2_client.describe_instances(InstanceIds=[inst_id])
-                            state = desc.get("Reservations", [{}])[0].get("Instances", [{}])[0].get("State", {}).get("Name")
-                            if state in ("terminated", "shutting-down"):
+                            resvs = desc.get("Reservations", []) if isinstance(desc, dict) else []
+                            insts = (
+                                resvs[0].get("Instances", [])
+                                if (resvs and isinstance(resvs[0], dict))
+                                else []
+                            )
+                            state = (
+                                insts[0].get("State", {}).get("Name")
+                                if (insts and isinstance(insts[0], dict))
+                                else None
+                            )
+                            if not resvs or not insts or state in ("terminated", "shutting-down"):
                                 resources_deleted.append(f"ec2-instance:{inst_id}")
                             else:
                                 resources_unverified.append(f"ec2-instance:{inst_id}")
                         except ClientError as e:
-                            if e.response.get("Error", {}).get("Code") in ("InvalidInstanceID.NotFound", "InvalidInstanceID.Malformed"):
+                            if e.response.get("Error", {}).get("Code") in (
+                                "InvalidInstanceID.NotFound",
+                                "InvalidInstanceID.Malformed",
+                            ):
                                 resources_deleted.append(f"ec2-instance:{inst_id}")
                             else:
                                 resources_unverified.append(f"ec2-instance:{inst_id}")
@@ -1014,16 +1077,26 @@ class P05Practical(PracticalContract):
                     # Check if already absent
                     try:
                         desc = ec2_client.describe_instances(InstanceIds=[inst_id])
-                        if isinstance(desc, dict):
-                            state = desc.get("Reservations", [{}])[0].get("Instances", [{}])[0].get("State", {}).get("Name")
-                            if state == "terminated":
-                                resources_absent.append(f"ec2-instance:{inst_id}")
-                            else:
-                                resources_failed.append(f"ec2-instance:{inst_id}")
-                        else:
+                        resvs = desc.get("Reservations", []) if isinstance(desc, dict) else []
+                        insts = (
+                            resvs[0].get("Instances", [])
+                            if (resvs and isinstance(resvs[0], dict))
+                            else []
+                        )
+                        state = (
+                            insts[0].get("State", {}).get("Name")
+                            if (insts and isinstance(insts[0], dict))
+                            else None
+                        )
+                        if not resvs or not insts or state == "terminated":
                             resources_absent.append(f"ec2-instance:{inst_id}")
+                        else:
+                            resources_failed.append(f"ec2-instance:{inst_id}")
                     except ClientError as e:
-                        if e.response.get("Error", {}).get("Code") in ("InvalidInstanceID.NotFound", "InvalidInstanceID.Malformed"):
+                        if e.response.get("Error", {}).get("Code") in (
+                            "InvalidInstanceID.NotFound",
+                            "InvalidInstanceID.Malformed",
+                        ):
                             resources_absent.append(f"ec2-instance:{inst_id}")
                         else:
                             resources_failed.append(f"ec2-instance:{inst_id}")
@@ -1037,7 +1110,9 @@ class P05Practical(PracticalContract):
         sg_ids = res_map.get("security-group", [])
         for sg_id in sg_ids:
             try:
-                sg_res = cleanup_ec2_resources(ec2_client, security_group_id=sg_id, expected_run_id=manifest.run_id)
+                sg_res = cleanup_ec2_resources(
+                    ec2_client, security_group_id=sg_id, expected_run_id=manifest.run_id
+                )
                 if sg_res:
                     if _is_mock_client(ec2_client):
                         resources_deleted.append(f"security-group:{sg_id}")
@@ -1050,7 +1125,10 @@ class P05Practical(PracticalContract):
                             else:
                                 resources_deleted.append(f"security-group:{sg_id}")
                         except ClientError as e:
-                            if e.response.get("Error", {}).get("Code") in ("InvalidGroup.NotFound", "InvalidGroupId.Malformed"):
+                            if e.response.get("Error", {}).get("Code") in (
+                                "InvalidGroup.NotFound",
+                                "InvalidGroupId.Malformed",
+                            ):
                                 resources_deleted.append(f"security-group:{sg_id}")
                             else:
                                 resources_unverified.append(f"security-group:{sg_id}")
@@ -1062,7 +1140,10 @@ class P05Practical(PracticalContract):
                         else:
                             resources_absent.append(f"security-group:{sg_id}")
                     except ClientError as e:
-                        if e.response.get("Error", {}).get("Code") in ("InvalidGroup.NotFound", "InvalidGroupId.Malformed"):
+                        if e.response.get("Error", {}).get("Code") in (
+                            "InvalidGroup.NotFound",
+                            "InvalidGroupId.Malformed",
+                        ):
                             resources_absent.append(f"security-group:{sg_id}")
                         else:
                             resources_failed.append(f"security-group:{sg_id}")
@@ -1076,7 +1157,9 @@ class P05Practical(PracticalContract):
         key_names = res_map.get("key-pair", [])
         for k_name in key_names:
             try:
-                kp_res = cleanup_ec2_resources(ec2_client, key_name=k_name, expected_run_id=manifest.run_id)
+                kp_res = cleanup_ec2_resources(
+                    ec2_client, key_name=k_name, expected_run_id=manifest.run_id
+                )
                 if kp_res:
                     resources_deleted.append(f"key-pair:{k_name}")
                 else:
@@ -1092,7 +1175,9 @@ class P05Practical(PracticalContract):
         profiles = res_map.get("iam-instance-profile", [])
         for prof in profiles:
             try:
-                prof_res = cleanup_iam_resources(iam_client, profile_name=prof, expected_run_id=manifest.run_id)
+                prof_res = cleanup_iam_resources(
+                    iam_client, profile_name=prof, expected_run_id=manifest.run_id
+                )
                 if prof_res:
                     if _is_mock_client(iam_client):
                         resources_deleted.append(f"iam-instance-profile:{prof}")
@@ -1121,7 +1206,9 @@ class P05Practical(PracticalContract):
         roles = res_map.get("iam-role", [])
         for role in roles:
             try:
-                role_res = cleanup_iam_resources(iam_client, role_name=role, expected_run_id=manifest.run_id)
+                role_res = cleanup_iam_resources(
+                    iam_client, role_name=role, expected_run_id=manifest.run_id
+                )
                 if role_res:
                     if _is_mock_client(iam_client):
                         resources_deleted.append(f"iam-role:{role}")
@@ -1150,7 +1237,9 @@ class P05Practical(PracticalContract):
         s3_client = adapter.get_client("s3")
         buckets = res_map.get("s3-bucket", [])
         objects = res_map.get("s3-object", [])
-        obj_keys = [o.split(f"s3://{b}/")[-1] for b in buckets for o in objects if f"s3://{b}/" in o]
+        obj_keys = [
+            o.split(f"s3://{b}/")[-1] for b in buckets for o in objects if f"s3://{b}/" in o
+        ]
 
         for b in buckets:
             try:
@@ -1207,7 +1296,10 @@ class P05Practical(PracticalContract):
                             else:
                                 resources_unverified.append(f"dynamodb-table:{tbl}")
                         except ClientError as e:
-                            if e.response.get("Error", {}).get("Code") in ("ResourceNotFoundException", "TableNotFoundException"):
+                            if e.response.get("Error", {}).get("Code") in (
+                                "ResourceNotFoundException",
+                                "TableNotFoundException",
+                            ):
                                 resources_deleted.append(f"dynamodb-table:{tbl}")
                             else:
                                 resources_unverified.append(f"dynamodb-table:{tbl}")
@@ -1233,7 +1325,7 @@ class P05Practical(PracticalContract):
         else:
             resources_absent.append(f"local-secret:{local_token}")
 
-        success = (len(resources_failed) == 0 and len(resources_unverified) == 0 and len(errors) == 0)
+        success = len(resources_failed) == 0 and len(resources_unverified) == 0 and len(errors) == 0
         return CleanupResult(
             practical_id="P05",
             run_id=manifest.run_id,

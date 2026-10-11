@@ -48,7 +48,9 @@ console = Console()
 def version_callback(value: bool) -> None:
     """Print application version and exit."""
     if value:
-        console.print(f"[bold cyan]CloudPrac[/bold cyan] version [bold white]{__version__}[/bold white]")
+        console.print(
+            f"[bold cyan]CloudPrac[/bold cyan] version [bold white]{__version__}[/bold white]"
+        )
         raise typer.Exit(0)
 
 
@@ -102,7 +104,9 @@ def inspect_practical(
     practical = registry.get(pid)
 
     if not practical:
-        print_error(f"Practical '{practical_id}' not found. Available IDs: {', '.join(registry.list_ids())}")
+        print_error(
+            f"Practical '{practical_id}' not found. Available IDs: {', '.join(registry.list_ids())}"
+        )
         raise typer.Exit(1)
 
     details = practical.inspect()
@@ -153,12 +157,24 @@ def menu_command() -> None:
 @app.command("plan")
 def plan_practical(
     practical_id: str = typer.Argument(..., help="Practical ID (e.g. P05, 5)"),
-    region: Optional[str] = typer.Option(None, "--region", "-r", help="Target AWS region override."),
-    instance_type: Optional[str] = typer.Option(None, "--instance-type", "-t", help="EC2 instance type override."),
-    key_name: Optional[str] = typer.Option(None, "--key-name", "-k", help="EC2 key pair name override."),
-    ssh_cidr: Optional[str] = typer.Option(None, "--ssh-cidr", help="Allowed IPv4 CIDR range for SSH ingress."),
-    app_port: Optional[int] = typer.Option(None, "--app-port", "--port", help="Port for web application (default 5000)."),
-    app_cidr: Optional[str] = typer.Option(None, "--app-cidr", "--cidr", help="Allowed IPv4 CIDR range for web application access."),
+    region: Optional[str] = typer.Option(
+        None, "--region", "-r", help="Target AWS region override."
+    ),
+    instance_type: Optional[str] = typer.Option(
+        None, "--instance-type", "-t", help="EC2 instance type override."
+    ),
+    key_name: Optional[str] = typer.Option(
+        None, "--key-name", "-k", help="EC2 key pair name override."
+    ),
+    ssh_cidr: Optional[str] = typer.Option(
+        None, "--ssh-cidr", help="Allowed IPv4 CIDR range for SSH ingress."
+    ),
+    app_port: Optional[int] = typer.Option(
+        None, "--app-port", "--port", help="Port for web application (default 5000)."
+    ),
+    app_cidr: Optional[str] = typer.Option(
+        None, "--app-cidr", "--cidr", help="Allowed IPv4 CIDR range for web application access."
+    ),
 ) -> None:
     """Generate a dry-run execution plan without modifying any AWS resources."""
     registry = get_registry()
@@ -197,16 +213,34 @@ def plan_practical(
 @app.command("run")
 def run_practical(
     practical_id: str = typer.Argument(..., help="Practical ID (e.g. P05, 5)"),
-    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt for safe execution."),
-    no_verify: bool = typer.Option(False, "--no-verify", help="Skip automatic verification after execution."),
-    auto_cleanup: bool = typer.Option(False, "--cleanup", help="Trigger cleanup immediately after run."),
-    region: Optional[str] = typer.Option(None, "--region", "-r", help="Target AWS region override."),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Skip confirmation prompt for safe execution."
+    ),
+    no_verify: bool = typer.Option(
+        False, "--no-verify", help="Skip automatic verification after execution."
+    ),
+    auto_cleanup: bool = typer.Option(
+        False, "--cleanup", help="Trigger cleanup immediately after run."
+    ),
+    region: Optional[str] = typer.Option(
+        None, "--region", "-r", help="Target AWS region override."
+    ),
     profile: Optional[str] = typer.Option(None, "--profile", "-p", help="AWS CLI profile name."),
-    instance_type: Optional[str] = typer.Option(None, "--instance-type", "-t", help="EC2 instance type override."),
-    key_name: Optional[str] = typer.Option(None, "--key-name", "-k", help="EC2 Key pair name override."),
-    ssh_cidr: Optional[str] = typer.Option(None, "--ssh-cidr", help="Allowed IPv4 CIDR range for SSH ingress."),
-    app_port: Optional[int] = typer.Option(None, "--app-port", "--port", help="Port for web application (default 5000)."),
-    app_cidr: Optional[str] = typer.Option(None, "--app-cidr", "--cidr", help="Allowed IPv4 CIDR range for web application access."),
+    instance_type: Optional[str] = typer.Option(
+        None, "--instance-type", "-t", help="EC2 instance type override."
+    ),
+    key_name: Optional[str] = typer.Option(
+        None, "--key-name", "-k", help="EC2 Key pair name override."
+    ),
+    ssh_cidr: Optional[str] = typer.Option(
+        None, "--ssh-cidr", help="Allowed IPv4 CIDR range for SSH ingress."
+    ),
+    app_port: Optional[int] = typer.Option(
+        None, "--app-port", "--port", help="Port for web application (default 5000)."
+    ),
+    app_cidr: Optional[str] = typer.Option(
+        None, "--app-cidr", "--cidr", help="Allowed IPv4 CIDR range for web application access."
+    ),
 ) -> None:
     """Safely execute a practical's AWS operations."""
     registry = get_registry()
@@ -237,7 +271,7 @@ def run_practical(
 
     config = load_config()
 
-    target_region = resolve_region(region) if region else resolve_region(config.default_region)
+    target_region = resolve_region(region, fallback=config.default_region)
     adapter = AWSAdapter(region_name=target_region, profile_name=profile)
     engine = ExecutionEngine(config=config, adapter=adapter)
 
@@ -247,10 +281,14 @@ def run_practical(
 
     # 2. Confirmation prompt if not --yes
     if not yes:
-        console.print("[bold yellow]Caution:[/bold yellow] This practical will provision real AWS resources in your account.")
+        console.print(
+            "[bold yellow]Caution:[/bold yellow] This practical will provision real AWS resources in your account."
+        )
         confirmed = typer.confirm("Do you approve this execution plan and wish to proceed?")
         if not confirmed:
-            console.print("[dim]Execution cancelled by user. No cloud resources were modified.[/dim]")
+            console.print(
+                "[dim]Execution cancelled by user. No cloud resources were modified.[/dim]"
+            )
             raise typer.Exit(0)
 
     try:
@@ -278,8 +316,12 @@ def run_practical(
                     key_file_path=result.outputs.get("key_file"),
                 )
             if not no_verify:
-                console.print(f"[dim]Use [bold white]cloudprac report {pid} --run-id {result.run_id}[/bold white] to view submission report.[/dim]")
-                console.print(f"[dim]When lab demonstration is complete, run [bold white]cloudprac cleanup {pid} --run-id {result.run_id}[/bold white] to destroy provisioned resources.[/dim]\n")
+                console.print(
+                    f"[dim]Use [bold white]cloudprac report {pid} --run-id {result.run_id}[/bold white] to view submission report.[/dim]"
+                )
+                console.print(
+                    f"[dim]When lab demonstration is complete, run [bold white]cloudprac cleanup {pid} --run-id {result.run_id}[/bold white] to destroy provisioned resources.[/dim]\n"
+                )
         else:
             error_summary = "; ".join(result.errors) if result.errors else "Unknown error"
             print_error(f"Execution encountered errors: {error_summary}")
@@ -313,8 +355,12 @@ def run_practical(
 @app.command("verify")
 def verify_practical(
     practical_id: str = typer.Argument(..., help="Practical ID (e.g. P05, 5)"),
-    run_id: Optional[str] = typer.Option(None, "--run-id", help="Specific run ID to verify against."),
-    region: Optional[str] = typer.Option(None, "--region", "-r", help="Target AWS region override."),
+    run_id: Optional[str] = typer.Option(
+        None, "--run-id", help="Specific run ID to verify against."
+    ),
+    region: Optional[str] = typer.Option(
+        None, "--region", "-r", help="Target AWS region override."
+    ),
     profile: Optional[str] = typer.Option(None, "--profile", "-p", help="AWS CLI profile name."),
 ) -> None:
     """Verify postcondition states on AWS for an executed practical."""
@@ -334,7 +380,7 @@ def verify_practical(
         raise typer.Exit(1)
 
     config = load_config()
-    target_region = resolve_region(region) if region else resolve_region(config.default_region)
+    target_region = resolve_region(region, fallback=config.default_region)
     adapter = AWSAdapter(region_name=target_region, profile_name=profile)
     verifier = VerificationEngine(adapter)
 
@@ -369,15 +415,21 @@ def report_practical(
     active_run_id = run_id or f"{pid}-latest"
     paths = reporter.generate_report(practical, active_run_id)
 
-    print_success(f"Evidence reports generated:\n- Markdown: {paths['markdown']}\n- JSON: {paths['json']}")
+    print_success(
+        f"Evidence reports generated:\n- Markdown: {paths['markdown']}\n- JSON: {paths['json']}"
+    )
 
 
 @app.command("cleanup")
 def cleanup_practical(
     practical_id: str = typer.Argument(..., help="Practical ID (e.g. P01, 1)"),
-    run_id: str = typer.Option(..., "--run-id", help="Required Run ID whose manifest should be cleaned."),
+    run_id: str = typer.Option(
+        ..., "--run-id", help="Required Run ID whose manifest should be cleaned."
+    ),
     yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation prompt."),
-    region: Optional[str] = typer.Option(None, "--region", "-r", help="Target AWS region override."),
+    region: Optional[str] = typer.Option(
+        None, "--region", "-r", help="Target AWS region override."
+    ),
     profile: Optional[str] = typer.Option(None, "--profile", "-p", help="AWS CLI profile name."),
 ) -> None:
     """Safely destroy only the AWS resources provisioned during a specific run."""
@@ -409,7 +461,9 @@ def cleanup_practical(
         if resources:
             console.print(f"\n[bold yellow]Cleanup Preview for Run '{run_id}':[/bold yellow]")
             for r in resources:
-                console.print(f"  • [red]DELETE[/red] {r.get('resource_type')}: [bold]{r.get('resource_id')}[/bold]")
+                console.print(
+                    f"  • [red]DELETE[/red] {r.get('resource_type')}: [bold]{r.get('resource_id')}[/bold]"
+                )
             console.print()
     except Exception as e:
         console.print(f"[dim]Could not preview manifest: {e}[/dim]")
@@ -421,8 +475,12 @@ def cleanup_practical(
             raise typer.Exit(0)
 
     config = load_config()
-    manifest_region = manifest_data.get("aws_region") if "manifest_data" in locals() and isinstance(manifest_data, dict) else None
-    target_region = resolve_region(region or manifest_region or config.default_region)
+    manifest_region = (
+        manifest_data.get("aws_region")
+        if "manifest_data" in locals() and isinstance(manifest_data, dict)
+        else None
+    )
+    target_region = resolve_region(region or manifest_region, fallback=config.default_region)
     adapter = AWSAdapter(region_name=target_region, profile_name=profile)
     engine = ExecutionEngine(config=config, adapter=adapter)
 
