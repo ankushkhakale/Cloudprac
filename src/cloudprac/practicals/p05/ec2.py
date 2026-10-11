@@ -554,7 +554,19 @@ def launch_ec2_instance(
                 f"(attempt {attempt + 1}/{max_retries})"
             )
             resp = ec2_client.run_instances(**launch_args)
-            instance_id = resp["Instances"][0]["InstanceId"]
+            instances = resp.get("Instances", [])
+            if not instances or not instances[0].get("InstanceId"):
+                raise RuntimeError(
+                    "RunInstances returned a success response but contained no instance ID. "
+                    f"Full response: {resp}"
+                )
+            instance_id = instances[0]["InstanceId"]
+            if not instance_id.startswith("i-"):
+                raise RuntimeError(
+                    f"RunInstances returned an unexpected instance ID format: '{instance_id}'. "
+                    "Expected an ID starting with 'i-'."
+                )
+            logger.info(f"EC2 instance launched successfully: {instance_id}")
             return instance_id
         except ClientError as e:
             err_msg = str(e)
@@ -574,22 +586,110 @@ def launch_ec2_instance(
             raise
 
 
-def wait_for_instance_running(ec2_client: Any, instance_id: str, max_timeout: int = 180) -> Dict[str, Any]:
-    """Poll until instance enters 'running' state or timeout is reached."""
+def wait_for_instance_running(
+    ec2_client: Any,
+    instance_id: str,
+    max_timeout: int = 180,
+    region: Optional[str] = None,
+    account_id: Optional[str] = None,
+    max_not_found_attempts: int = 8,
+) -> Dict[str, Any]:
+    """Poll until instance enters 'running' state or timeout is reached.
+
+    Handles the EC2 control-plane propagation delay: ``DescribeInstances`` may
+    return ``InvalidInstanceID.NotFound`` for up to ~30 s after ``RunInstances``
+    returns the ID.  This is expected eventual-consistency behaviour, not a sign
+    that the launch failed.  We treat it as a transient condition and retry with
+    a bounded attempt threshold (*max_not_found_attempts*), logging each occurrence.
+
+    If the instance does not exist in the targeted region or was never created,
+    polling fails with a descriptive error message stating the instance ID,
+    region, and account, pointing to cleanup.
+    """
+    if not instance_id or not instance_id.startswith("i-"):
+        raise ValueError(
+            f"wait_for_instance_running received an invalid instance ID: '{instance_id}'. "
+            "RunInstances did not return a recognised instance ID."
+        )
+
+    # Give EC2's control plane a brief head-start before the first poll.
+    # This reduces (but does not eliminate) the NotFound propagation window.
+    time.sleep(3)
+
+    if not region:
+        _meta = getattr(ec2_client, "meta", None)
+        target_region = (_meta.region_name if _meta else None) or "unknown"
+    else:
+        target_region = region
+    target_account = account_id or "unknown"
+
     start_time = time.time()
+    not_found_count = 0
+    ever_found = False
+    last_state = "unknown"
+    _NOT_FOUND_CODES = frozenset({"InvalidInstanceID.NotFound", "InvalidInstanceID.Malformed"})
+
     while time.time() - start_time < max_timeout:
-        resp = ec2_client.describe_instances(InstanceIds=[instance_id])
-        reservations = resp.get("Reservations", [])
-        if reservations and reservations[0].get("Instances"):
-            instance = reservations[0]["Instances"][0]
-            state = instance.get("State", {}).get("Name", "")
-            if state == "running":
-                return instance
-            if state in ("terminated", "shutting-down"):
-                raise RuntimeError(f"EC2 instance {instance_id} unexpectedly entered '{state}' state.")
+        try:
+            resp = ec2_client.describe_instances(InstanceIds=[instance_id])
+            not_found_count = 0  # Reset on a successful describe call
+            reservations = resp.get("Reservations", [])
+            if reservations and reservations[0].get("Instances"):
+                ever_found = True
+                instance = reservations[0]["Instances"][0]
+                state = instance.get("State", {}).get("Name", "")
+                last_state = state
+                if state == "running":
+                    return instance
+                if state in ("terminated", "shutting-down"):
+                    raise RuntimeError(
+                        f"EC2 instance {instance_id} unexpectedly entered '{state}' state while waiting. "
+                        "Check the EC2 console for launch errors (e.g. insufficient capacity, "
+                        "quota exceeded, or user-data failure)."
+                    )
+                logger.debug(f"Instance {instance_id} state: '{state}', continuing to wait...")
+        except ClientError as e:
+            err_code = e.response.get("Error", {}).get("Code", "")
+            if err_code in _NOT_FOUND_CODES:
+                not_found_count += 1
+                elapsed = int(time.time() - start_time)
+                logger.info(
+                    f"Instance {instance_id} not yet visible in DescribeInstances "
+                    f"(EC2 propagation delay, attempt {not_found_count}, {elapsed}s elapsed). "
+                    "This is normal for up to ~30s after launch — retrying..."
+                )
+                if not_found_count >= max_not_found_attempts:
+                    raise RuntimeError(
+                        f"DescribeInstances failed: EC2 instance '{instance_id}' does not exist "
+                        f"in region '{target_region}' (account: '{target_account}') "
+                        f"after {not_found_count} polling attempts ({elapsed}s elapsed). "
+                        "The instance does not exist in the targeted region or was never created. "
+                        "Use 'cloudprac cleanup P05 --run-id <run-id>' to clean up any partial resources."
+                    ) from e
+            else:
+                # Non-transient error (e.g. AuthFailure, throttling beyond retry): escalate
+                raise RuntimeError(
+                    f"DescribeInstances for {instance_id} in region '{target_region}' "
+                    f"(account: '{target_account}') returned an unexpected error: {e}"
+                ) from e
         time.sleep(5)
 
-    raise TimeoutError(f"EC2 instance {instance_id} did not transition to 'running' within {max_timeout}s.")
+    if not ever_found:
+        raise RuntimeError(
+            f"DescribeInstances failed: EC2 instance '{instance_id}' does not exist "
+            f"in region '{target_region}' (account: '{target_account}') "
+            f"within {max_timeout}s timeout. "
+            "The instance does not exist in the targeted region or was never created. "
+            "Use 'cloudprac cleanup P05 --run-id <run-id>' to clean up any partial resources."
+        )
+
+    raise TimeoutError(
+        f"EC2 instance {instance_id} in region '{target_region}' did not transition to 'running' within {max_timeout}s "
+        f"(last observed state: '{last_state}'). "
+        "The instance may still be starting — check the EC2 console. "
+        f"Use 'cloudprac cleanup P05 --run-id <run-id>' to clean up if no longer needed."
+    )
+
 
 
 def check_application_health(

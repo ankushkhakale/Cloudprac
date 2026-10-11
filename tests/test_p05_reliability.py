@@ -66,7 +66,10 @@ def test_is_real_public_ip_rejects_placeholders_and_invalid_formats():
 def test_probe_endpoint_handles_timeouts_and_crashes_gracefully():
     """Verify probe_endpoint captures network timeouts, refusal, and HTTP errors without throwing unhandled exceptions."""
     # 1. Connection Refused
-    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError(ConnectionRefusedError("Connection refused"))):
+    with patch(
+        "urllib.request.urlopen",
+        side_effect=urllib.error.URLError(ConnectionRefusedError("Connection refused")),
+    ):
         ok, code, msg, body = probe_endpoint("http://54.200.10.25:5000/health", timeout=1.0)
         assert ok is False
         assert code == 0
@@ -139,7 +142,12 @@ def test_verify_application_and_preview_full_successful_suite():
         if url.endswith("/health"):
             return True, 200, "HTTP 200 OK", {"status": "healthy"}
         if url.endswith("/api/students") and method == "GET":
-            return True, 200, "HTTP 200 OK", {"students": [{"student_id": "STU-001", "name": "Alice"}]}
+            return (
+                True,
+                200,
+                "HTTP 200 OK",
+                {"students": [{"student_id": "STU-001", "name": "Alice"}]},
+            )
         if url.endswith("/api/students/STU-001") and method == "GET":
             return True, 200, "HTTP 200 OK", {"student_id": "STU-001", "name": "Alice"}
         if url.endswith("/api/students") and method == "POST":
@@ -296,14 +304,19 @@ def test_cleanup_separates_absent_deleted_and_unverified_resources():
     mock_dynamodb = MagicMock()
 
     # S3 bucket is already absent prior to cleanup (ownership check encounters NoSuchBucket)
-    mock_s3.get_bucket_tagging.side_effect = ClientError({"Error": {"Code": "NoSuchBucket"}}, "GetBucketTagging")
+    mock_s3.get_bucket_tagging.side_effect = ClientError(
+        {"Error": {"Code": "NoSuchBucket"}}, "GetBucketTagging"
+    )
 
     # DynamoDB table is present and owned, deletion succeeds
     mock_dynamodb.describe_table.return_value = {
         "Table": {"TableArn": "arn:aws:dynamodb:us-east-1:123456789012:table/deleted-table"}
     }
     mock_dynamodb.list_tags_of_resource.return_value = {
-        "Tags": [{"Key": "ManagedBy", "Value": "CloudPrac"}, {"Key": "RunId", "Value": "run-cleanup-split-001"}]
+        "Tags": [
+            {"Key": "ManagedBy", "Value": "CloudPrac"},
+            {"Key": "RunId", "Value": "run-cleanup-split-001"},
+        ]
     }
     mock_dynamodb.delete_table.return_value = {}
 
@@ -311,7 +324,9 @@ def test_cleanup_separates_absent_deleted_and_unverified_resources():
     adapter.get_caller_identity = MagicMock(return_value={"Account": "123456789012"})
 
     def mock_get_client(service, region_name=None):
-        return {"s3": mock_s3, "dynamodb": mock_dynamodb, "ec2": MagicMock(), "iam": MagicMock()}[service]
+        return {"s3": mock_s3, "dynamodb": mock_dynamodb, "ec2": MagicMock(), "iam": MagicMock()}[
+            service
+        ]
 
     adapter.get_client = mock_get_client
 
@@ -328,11 +343,17 @@ def test_cleanup_drains_s3_versions_and_delete_markers():
     mock_s3 = MagicMock()
 
     mock_s3.get_bucket_tagging.return_value = {
-        "TagSet": [{"Key": "ManagedBy", "Value": "CloudPrac"}, {"Key": "RunId", "Value": "run-version-test"}]
+        "TagSet": [
+            {"Key": "ManagedBy", "Value": "CloudPrac"},
+            {"Key": "RunId", "Value": "run-version-test"},
+        ]
     }
     mock_s3.list_objects_v2.return_value = {"Contents": []}
     mock_s3.list_object_versions.return_value = {
-        "Versions": [{"Key": "doc1.txt", "VersionId": "v1"}, {"Key": "doc1.txt", "VersionId": "v2"}],
+        "Versions": [
+            {"Key": "doc1.txt", "VersionId": "v1"},
+            {"Key": "doc1.txt", "VersionId": "v2"},
+        ],
         "DeleteMarkers": [{"Key": "doc1.txt", "VersionId": "dm1"}],
     }
     mock_s3.delete_objects.return_value = {}
@@ -358,7 +379,10 @@ def test_cleanup_s3_handles_paginated_versions_and_delete_markers():
     """Verify cleanup_s3_resources handles paginated list_object_versions calls."""
     mock_s3 = MagicMock()
     mock_s3.get_bucket_tagging.return_value = {
-        "TagSet": [{"Key": "ManagedBy", "Value": "CloudPrac"}, {"Key": "RunId", "Value": "run-page-test"}]
+        "TagSet": [
+            {"Key": "ManagedBy", "Value": "CloudPrac"},
+            {"Key": "RunId", "Value": "run-page-test"},
+        ]
     }
     mock_s3.list_objects_v2.return_value = {"Contents": []}
 
@@ -399,13 +423,14 @@ def test_cleanup_s3_fails_and_raises_when_delete_objects_returns_errors():
     """Verify cleanup_s3_resources raises RuntimeError when delete_objects reports errors."""
     mock_s3 = MagicMock()
     mock_s3.get_bucket_tagging.return_value = {
-        "TagSet": [{"Key": "ManagedBy", "Value": "CloudPrac"}, {"Key": "RunId", "Value": "run-err-test"}]
+        "TagSet": [
+            {"Key": "ManagedBy", "Value": "CloudPrac"},
+            {"Key": "RunId", "Value": "run-err-test"},
+        ]
     }
     mock_s3.list_objects_v2.return_value = {"Contents": [{"Key": "protected-doc.txt"}]}
     mock_s3.delete_objects.return_value = {
-        "Errors": [
-            {"Key": "protected-doc.txt", "Code": "AccessDenied", "Message": "Access Denied"}
-        ]
+        "Errors": [{"Key": "protected-doc.txt", "Code": "AccessDenied", "Message": "Access Denied"}]
     }
 
     with pytest.raises(RuntimeError) as exc_info:
@@ -424,7 +449,10 @@ def test_cleanup_s3_does_not_swallow_client_error_during_version_listing():
     """Verify cleanup_s3_resources propagates ClientError instead of swallowing exceptions."""
     mock_s3 = MagicMock()
     mock_s3.get_bucket_tagging.return_value = {
-        "TagSet": [{"Key": "ManagedBy", "Value": "CloudPrac"}, {"Key": "RunId", "Value": "run-s3-fail"}]
+        "TagSet": [
+            {"Key": "ManagedBy", "Value": "CloudPrac"},
+            {"Key": "RunId", "Value": "run-s3-fail"},
+        ]
     }
     mock_s3.list_objects_v2.return_value = {"Contents": []}
     mock_s3.list_object_versions.side_effect = ClientError(
@@ -623,7 +651,9 @@ def test_cleanup_ec2_termination_wait_handles_empty_reservations():
     empty_desc = {"Reservations": []}
 
     mock_ec2.describe_instances.side_effect = [ownership_desc, empty_desc]
-    mock_ec2.terminate_instances.return_value = {"TerminatingInstances": [{"InstanceId": "i-termwait"}]}
+    mock_ec2.terminate_instances.return_value = {
+        "TerminatingInstances": [{"InstanceId": "i-termwait"}]
+    }
 
     with patch("time.sleep", return_value=None):
         deleted = cleanup_ec2_resources(
@@ -636,3 +666,303 @@ def test_cleanup_ec2_termination_wait_handles_empty_reservations():
     # Must have called describe_instances exactly twice (ownership + first poll)
     assert mock_ec2.describe_instances.call_count == 2
 
+
+# ==============================================================================
+# 12. wait_for_instance_running: InvalidInstanceID.NotFound is Transient
+# ==============================================================================
+
+
+def test_wait_for_instance_running_retries_on_not_found_then_succeeds():
+    """
+    Regression test for the live failure:
+      EC2 Error: InvalidInstanceID.NotFound when calling DescribeInstances:
+      instance ID i-063d9c7acc316374d does not exist
+
+    Root cause: DescribeInstances may return NotFound for up to ~30s after
+    RunInstances completes (EC2 control-plane propagation).  The fix retries
+    this specific error code instead of propagating it as a fatal exception.
+    """
+    from botocore.exceptions import ClientError as BotoCoreClientError
+
+    from cloudprac.practicals.p05.ec2 import wait_for_instance_running
+
+    mock_ec2 = MagicMock()
+
+    not_found_error = BotoCoreClientError(
+        {
+            "Error": {
+                "Code": "InvalidInstanceID.NotFound",
+                "Message": "instance ID i-063d9c7acc316374d does not exist",
+            }
+        },
+        "DescribeInstances",
+    )
+    running_response = {
+        "Reservations": [
+            {
+                "Instances": [
+                    {
+                        "InstanceId": "i-063d9c7acc316374d",
+                        "State": {"Name": "running"},
+                        "PublicIpAddress": "54.200.10.25",
+                    }
+                ]
+            }
+        ]
+    }
+
+    # First two calls raise NotFound; third succeeds with running state
+    mock_ec2.describe_instances.side_effect = [not_found_error, not_found_error, running_response]
+
+    with patch("time.sleep", return_value=None):
+        result = wait_for_instance_running(mock_ec2, "i-063d9c7acc316374d", max_timeout=60)
+
+    assert result["State"]["Name"] == "running"
+    assert result["PublicIpAddress"] == "54.200.10.25"
+    assert mock_ec2.describe_instances.call_count == 3
+
+
+def test_wait_for_instance_running_escalates_non_transient_client_error():
+    """
+    A ClientError that is NOT InvalidInstanceID.NotFound (e.g. AuthFailure) must
+    be raised immediately — not silently swallowed or retried indefinitely.
+    """
+    from botocore.exceptions import ClientError as BotoCoreClientError
+
+    from cloudprac.practicals.p05.ec2 import wait_for_instance_running
+
+    mock_ec2 = MagicMock()
+    auth_error = BotoCoreClientError(
+        {"Error": {"Code": "AuthFailure", "Message": "Not authorised"}},
+        "DescribeInstances",
+    )
+    mock_ec2.describe_instances.side_effect = auth_error
+
+    with patch("time.sleep", return_value=None):
+        with pytest.raises(RuntimeError, match="AuthFailure"):
+            wait_for_instance_running(mock_ec2, "i-realinstance123", max_timeout=30)
+
+    # Should stop after the first non-transient error, not exhaust the timeout
+    assert mock_ec2.describe_instances.call_count == 1
+
+
+def test_wait_for_instance_running_rejects_invalid_instance_id():
+    """validate_instance_id check: empty or malformed IDs are rejected before any API call."""
+    from cloudprac.practicals.p05.ec2 import wait_for_instance_running
+
+    mock_ec2 = MagicMock()
+    with pytest.raises(ValueError, match="invalid instance ID"):
+        wait_for_instance_running(mock_ec2, "", max_timeout=10)
+
+    with pytest.raises(ValueError, match="invalid instance ID"):
+        wait_for_instance_running(mock_ec2, "not-an-id", max_timeout=10)
+
+    mock_ec2.describe_instances.assert_not_called()
+
+
+def test_launch_ec2_instance_raises_on_empty_instances_in_response():
+    """RunInstances returning an empty Instances list must raise RuntimeError, not IndexError."""
+    from cloudprac.practicals.p05.ec2 import launch_ec2_instance
+
+    mock_ec2 = MagicMock()
+    # AWS returns HTTP 200 but Instances list is empty (should never happen in practice
+    # but we must not crash with an opaque IndexError)
+    mock_ec2.run_instances.return_value = {"Instances": []}
+
+    with patch("time.sleep", return_value=None):
+        with pytest.raises(RuntimeError, match="no instance ID"):
+            launch_ec2_instance(
+                ec2_client=mock_ec2,
+                image_id="ami-abc",
+                instance_type="t2.micro",
+                subnet_id="subnet-xyz",
+                security_group_id="sg-xyz",
+            )
+
+
+def test_wait_for_instance_running_bounded_not_found_raises_diagnostic_error():
+    """
+    When DescribeInstances repeatedly fails with InvalidInstanceID.NotFound beyond
+    max_not_found_attempts, wait_for_instance_running must fail with a clear diagnostic
+    error detailing the instance ID, targeted region, account, and recovery guidance.
+    """
+    from botocore.exceptions import ClientError as BotoCoreClientError
+
+    from cloudprac.practicals.p05.ec2 import wait_for_instance_running
+
+    mock_ec2 = MagicMock()
+    not_found_error = BotoCoreClientError(
+        {
+            "Error": {
+                "Code": "InvalidInstanceID.NotFound",
+                "Message": "The instance ID does not exist",
+            }
+        },
+        "DescribeInstances",
+    )
+    mock_ec2.describe_instances.side_effect = not_found_error
+
+    with patch("time.sleep", return_value=None):
+        with pytest.raises(RuntimeError) as exc_info:
+            wait_for_instance_running(
+                mock_ec2,
+                "i-063d9c7acc316374d",
+                max_timeout=60,
+                region="ap-south-1",
+                account_id="123456789012",
+                max_not_found_attempts=4,
+            )
+
+    err = str(exc_info.value)
+    assert "i-063d9c7acc316374d" in err
+    assert "ap-south-1" in err
+    assert "123456789012" in err
+    assert "does not exist in region 'ap-south-1'" in err
+    assert "cloudprac cleanup P05" in err
+    assert mock_ec2.describe_instances.call_count == 4
+
+
+def test_wait_for_instance_running_timeout_never_found_raises_diagnostic_error():
+    """
+    When wait_for_instance_running times out without ever finding the instance,
+    it must raise RuntimeError with diagnostic region and account context.
+    """
+    from botocore.exceptions import ClientError as BotoCoreClientError
+
+    from cloudprac.practicals.p05.ec2 import wait_for_instance_running
+
+    mock_ec2 = MagicMock()
+    not_found_error = BotoCoreClientError(
+        {
+            "Error": {
+                "Code": "InvalidInstanceID.NotFound",
+                "Message": "The instance ID does not exist",
+            }
+        },
+        "DescribeInstances",
+    )
+    mock_ec2.describe_instances.side_effect = not_found_error
+
+    # Simulate timeout reached
+    times = iter([0.0, 0.0, 5.0, 100.0])
+    with patch("time.time", side_effect=lambda: next(times, 100.0)):
+        with patch("time.sleep", return_value=None):
+            with pytest.raises(RuntimeError) as exc_info:
+                wait_for_instance_running(
+                    mock_ec2,
+                    "i-notfoundtimeout",
+                    max_timeout=10,
+                    region="eu-west-1",
+                    account_id="999988887777",
+                    max_not_found_attempts=20,
+                )
+
+    err = str(exc_info.value)
+    assert "i-notfoundtimeout" in err
+    assert "eu-west-1" in err
+    assert "999988887777" in err
+    assert "does not exist in region 'eu-west-1'" in err
+
+
+def test_p05_execution_failure_persists_instance_to_manifest_and_allows_cleanup(tmp_path):
+    """
+    Regression test verifying requirement 4 & 6:
+    When EC2 launch succeeds and returns an instance ID, but subsequent wait_for_instance_running
+    fails, the manifest on disk MUST record the instance ID, and cleanup must be able to remove it.
+    """
+    from botocore.exceptions import ClientError as BotoCoreClientError
+
+    from cloudprac.core.models import ExecutionPlan
+    from cloudprac.practicals.p05.practical import P05Practical
+
+    practical = P05Practical()
+    practical.p05_config.app_cidr = "192.0.2.1/32"
+
+    mock_adapter = MagicMock(spec=AWSAdapter)
+    mock_adapter.mock_mode = False
+    mock_adapter.region_name = "us-east-1"
+    mock_adapter.get_caller_identity.return_value = {"Account": "123456789012"}
+
+    mock_s3 = MagicMock()
+    mock_dynamodb = MagicMock()
+    mock_iam = MagicMock()
+    mock_ec2 = MagicMock()
+
+    mock_adapter.get_client.side_effect = lambda service, **kwargs: {
+        "s3": mock_s3,
+        "dynamodb": mock_dynamodb,
+        "iam": mock_iam,
+        "ec2": mock_ec2,
+    }.get(service, MagicMock())
+
+    # Mock DynamoDB active status
+    mock_dynamodb.describe_table.return_value = {"Table": {"TableStatus": "ACTIVE"}}
+
+    # Mock prerequisite steps
+    mock_ec2.describe_subnets.return_value = {
+        "Subnets": [{"SubnetId": "subnet-test123", "VpcId": "vpc-test123"}]
+    }
+    mock_ec2.create_security_group.return_value = {"GroupId": "sg-test123"}
+    mock_ec2.describe_images.return_value = {"Images": [{"ImageId": "ami-test123"}]}
+    mock_ec2.create_key_pair.return_value = {"KeyMaterial": "fake-key", "KeyName": "key-test"}
+    mock_ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-manifestpersist"}]}
+
+    # Fail wait_for_instance_running
+    not_found_err = BotoCoreClientError(
+        {"Error": {"Code": "InvalidInstanceID.NotFound", "Message": "Not found"}},
+        "DescribeInstances",
+    )
+    mock_ec2.describe_instances.side_effect = not_found_err
+
+    run_id = "test-persist-fail-001"
+    plan = ExecutionPlan(
+        practical_id="P05",
+        run_id=run_id,
+        aws_account_id="123456789012",
+        aws_region="us-east-1",
+        actions=[],
+    )
+
+    with patch("cloudprac.practicals.p05.practical.get_run_dir", return_value=tmp_path / run_id):
+        with patch("cloudprac.practicals.p05.practical.save_restricted_file"):
+            with patch("time.sleep", return_value=None):
+                result = practical.execute(plan, mock_adapter)
+
+    # 1. Execution must report failure
+    assert result.success is False
+    assert any("EC2 Error" in e for e in result.errors)
+
+    # 2. Manifest on disk must contain the created EC2 instance ID
+    manifest_file = tmp_path / run_id / "manifest.json"
+    assert manifest_file.exists()
+    manifest_content = manifest_file.read_text(encoding="utf-8")
+    assert "i-manifestpersist" in manifest_content
+
+    # 3. Cleanup must target that instance
+    mock_ec2.terminate_instances.return_value = {
+        "TerminatingInstances": [{"InstanceId": "i-manifestpersist"}]
+    }
+    ownership_desc = {
+        "Reservations": [
+            {
+                "Instances": [
+                    {
+                        "State": {"Name": "running"},
+                        "Tags": [
+                            {"Key": "ManagedBy", "Value": "CloudPrac"},
+                            {"Key": "RunId", "Value": run_id},
+                        ],
+                    }
+                ]
+            }
+        ]
+    }
+    # Reset mock_ec2 describe_instances for cleanup
+    mock_ec2.describe_instances.side_effect = [ownership_desc, {"Reservations": []}]
+
+    manifest_obj = RunManifest.model_validate_json(manifest_file.read_text(encoding="utf-8"))
+    with patch("cloudprac.practicals.p05.practical.get_run_dir", return_value=tmp_path / run_id):
+        with patch("time.sleep", return_value=None):
+            cleanup_result = practical.cleanup(manifest_obj, mock_adapter)
+
+    assert "ec2-instance:i-manifestpersist" in cleanup_result.resources_deleted

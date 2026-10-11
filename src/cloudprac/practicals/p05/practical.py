@@ -599,7 +599,12 @@ class P05Practical(PracticalContract):
 
             # Wait for instance running state
             logger.info(f"Waiting for instance '{instance_id}' to enter 'running' state...")
-            inst_data = wait_for_instance_running(ec2_client, instance_id)
+            inst_data = wait_for_instance_running(
+                ec2_client,
+                instance_id,
+                region=region,
+                account_id=raw_account,
+            )
             public_ip = inst_data.get("PublicIpAddress", "")
 
             # Validate real public IP

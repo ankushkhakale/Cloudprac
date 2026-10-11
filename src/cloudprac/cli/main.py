@@ -281,10 +281,32 @@ def run_practical(
                 console.print(f"[dim]Use [bold white]cloudprac report {pid} --run-id {result.run_id}[/bold white] to view submission report.[/dim]")
                 console.print(f"[dim]When lab demonstration is complete, run [bold white]cloudprac cleanup {pid} --run-id {result.run_id}[/bold white] to destroy provisioned resources.[/dim]\n")
         else:
-            print_error(f"Execution encountered errors: {'; '.join(result.errors)}")
+            error_summary = "; ".join(result.errors) if result.errors else "Unknown error"
+            print_error(f"Execution encountered errors: {error_summary}")
+            # If partial resources were provisioned, tell the student how to clean them up
+            manifest = getattr(result, "manifest", None)
+            resource_count = len(manifest.resources) if manifest else 0
+            if resource_count > 0:
+                console.print(
+                    f"\n[bold yellow]⚠ Partial resources were provisioned (Run ID: [white]{result.run_id}[/white]).[/bold yellow]\n"
+                    f"[dim]{resource_count} resource(s) were created before the failure. "
+                    f"Run the following command to clean them up:[/dim]\n\n"
+                    f"  [bold white]cloudprac cleanup {pid} --run-id {result.run_id}[/bold white]\n"
+                )
             raise typer.Exit(1)
+    except typer.Exit:
+        raise
     except Exception as e:
         print_error(f"Failed to run practical {pid}: {e}")
+        if "plan" in locals() and plan and hasattr(plan, "run_id"):
+            run_dir = get_run_dir(plan.run_id)
+            manifest_file = run_dir / "manifest.json"
+            if manifest_file.exists():
+                console.print(
+                    f"\n[bold yellow]⚠ Partial resources may have been provisioned (Run ID: [white]{plan.run_id}[/white]).[/bold yellow]\n"
+                    f"[dim]Run the following command to clean them up:[/dim]\n\n"
+                    f"  [bold white]cloudprac cleanup {pid} --run-id {plan.run_id}[/bold white]\n"
+                )
         raise typer.Exit(1)
 
 
@@ -400,7 +422,7 @@ def cleanup_practical(
 
     config = load_config()
     manifest_region = manifest_data.get("aws_region") if "manifest_data" in locals() and isinstance(manifest_data, dict) else None
-    target_region = region or manifest_region or config.default_region
+    target_region = resolve_region(region or manifest_region or config.default_region)
     adapter = AWSAdapter(region_name=target_region, profile_name=profile)
     engine = ExecutionEngine(config=config, adapter=adapter)
 
