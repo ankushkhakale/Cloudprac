@@ -477,3 +477,162 @@ def test_cleanup_result_model_validator_never_allows_success_with_failed_or_unve
         resources_absent=["dynamodb-table:tbl1"],
     )
     assert res4.success is True
+
+
+# ==============================================================================
+# 8. Region Resolution: AWS_REGION Takes Precedence over AWS_DEFAULT_REGION
+# ==============================================================================
+
+
+def test_resolve_region_priority_chain(monkeypatch):
+    """Verify resolve_region applies the correct priority: explicit > AWS_REGION > AWS_DEFAULT_REGION > default."""
+    from cloudprac.adapters.aws_client import resolve_region
+
+    # 1. Explicit always wins
+    monkeypatch.setenv("AWS_REGION", "eu-west-1")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "ap-south-1")
+    assert resolve_region("us-west-2") == "us-west-2"
+
+    # 2. AWS_REGION beats AWS_DEFAULT_REGION
+    assert resolve_region(None) == "eu-west-1"
+
+    # 3. AWS_DEFAULT_REGION used when AWS_REGION is absent
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    assert resolve_region(None) == "ap-south-1"
+
+    # 4. Hard-coded fallback when neither env var is set
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    assert resolve_region(None) == "us-east-1"
+
+
+def test_aws_adapter_picks_up_aws_region_env_var(monkeypatch):
+    """AWSAdapter must read AWS_REGION (CloudShell default) not just AWS_DEFAULT_REGION."""
+    monkeypatch.setenv("AWS_REGION", "ap-southeast-1")
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+
+    from cloudprac.adapters.aws_client import AWSAdapter
+
+    adapter = AWSAdapter()
+    assert adapter.region == "ap-southeast-1"
+
+
+# ==============================================================================
+# 9. EC2 Subnet Selection Prefers MapPublicIpOnLaunch=True
+# ==============================================================================
+
+
+def test_get_default_or_first_vpc_prefers_public_subnet():
+    """Verify get_default_or_first_vpc selects a subnet with MapPublicIpOnLaunch=True over a private one."""
+    from cloudprac.practicals.p05.ec2 import get_default_or_first_vpc
+
+    mock_ec2 = MagicMock()
+    mock_ec2.describe_vpcs.return_value = {"Vpcs": [{"VpcId": "vpc-default"}]}
+    mock_ec2.describe_subnets.return_value = {
+        "Subnets": [
+            {"SubnetId": "subnet-private", "MapPublicIpOnLaunch": False},
+            {"SubnetId": "subnet-public", "MapPublicIpOnLaunch": True},
+        ]
+    }
+
+    vpc_id, subnet_id = get_default_or_first_vpc(mock_ec2)
+    assert vpc_id == "vpc-default"
+    assert subnet_id == "subnet-public"
+
+
+def test_get_default_or_first_vpc_fallback_to_private_subnet_when_no_public_subnet():
+    """Verify fallback to first subnet when no public subnet is available (no error; caller must request IP explicitly)."""
+    from cloudprac.practicals.p05.ec2 import get_default_or_first_vpc
+
+    mock_ec2 = MagicMock()
+    mock_ec2.describe_vpcs.return_value = {"Vpcs": [{"VpcId": "vpc-default"}]}
+    mock_ec2.describe_subnets.return_value = {
+        "Subnets": [
+            {"SubnetId": "subnet-private-a", "MapPublicIpOnLaunch": False},
+            {"SubnetId": "subnet-private-b", "MapPublicIpOnLaunch": False},
+        ]
+    }
+
+    vpc_id, subnet_id = get_default_or_first_vpc(mock_ec2)
+    # Falls back gracefully; first subnet chosen
+    assert subnet_id == "subnet-private-a"
+
+
+# ==============================================================================
+# 10. launch_ec2_instance Uses AssociatePublicIpAddress=True via NetworkInterfaces
+# ==============================================================================
+
+
+def test_launch_ec2_instance_requests_public_ip_via_network_interface():
+    """Verify that launch_ec2_instance passes AssociatePublicIpAddress=True on the primary network interface."""
+    from cloudprac.practicals.p05.ec2 import launch_ec2_instance
+
+    mock_ec2 = MagicMock()
+    mock_ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-publicip123"}]}
+
+    with patch("time.sleep", return_value=None):
+        inst_id = launch_ec2_instance(
+            ec2_client=mock_ec2,
+            image_id="ami-abcdef",
+            instance_type="t2.micro",
+            subnet_id="subnet-private-xyz",
+            security_group_id="sg-xyz",
+        )
+
+    assert inst_id == "i-publicip123"
+    call_kwargs = mock_ec2.run_instances.call_args[1]
+    net_ifaces = call_kwargs.get("NetworkInterfaces", [])
+    assert len(net_ifaces) == 1
+    primary = net_ifaces[0]
+    assert primary["DeviceIndex"] == 0
+    assert primary["AssociatePublicIpAddress"] is True
+    assert primary["SubnetId"] == "subnet-private-xyz"
+    assert "sg-xyz" in primary["Groups"]
+    # SubnetId and SecurityGroupIds must NOT appear at top level when using NetworkInterfaces
+    assert "SubnetId" not in call_kwargs
+    assert "SecurityGroupIds" not in call_kwargs
+
+
+# ==============================================================================
+# 11. Termination Wait Loop Does Not Crash on Empty Reservations
+# ==============================================================================
+
+
+def test_cleanup_ec2_termination_wait_handles_empty_reservations():
+    """Verify cleanup_ec2_resources handles DescribeInstances returning empty Reservations (instance gone) gracefully."""
+    from cloudprac.practicals.p05.ec2 import cleanup_ec2_resources
+
+    mock_ec2 = MagicMock()
+
+    # Ownership check: instance present with correct tags
+    ownership_desc = {
+        "Reservations": [
+            {
+                "Instances": [
+                    {
+                        "State": {"Name": "running"},
+                        "Tags": [
+                            {"Key": "ManagedBy", "Value": "CloudPrac"},
+                            {"Key": "RunId", "Value": "run-termwait-001"},
+                        ],
+                    }
+                ]
+            }
+        ]
+    }
+    # After terminate: first poll returns empty Reservations (instance gone)
+    empty_desc = {"Reservations": []}
+
+    mock_ec2.describe_instances.side_effect = [ownership_desc, empty_desc]
+    mock_ec2.terminate_instances.return_value = {"TerminatingInstances": [{"InstanceId": "i-termwait"}]}
+
+    with patch("time.sleep", return_value=None):
+        deleted = cleanup_ec2_resources(
+            ec2_client=mock_ec2,
+            instance_id="i-termwait",
+            expected_run_id="run-termwait-001",
+        )
+
+    assert "ec2-instance:i-termwait" in deleted
+    # Must have called describe_instances exactly twice (ownership + first poll)
+    assert mock_ec2.describe_instances.call_count == 2
+

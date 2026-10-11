@@ -9,6 +9,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 from cloudprac.utils.logging import get_logger
 
 ENV_MOCK_AWS = "CLOUDPRAC_MOCK_AWS"
+_DEFAULT_REGION = "us-east-1"
 logger = get_logger()
 
 
@@ -17,6 +18,24 @@ def mask_account_id(account_id: str) -> str:
     if len(account_id) >= 8:
         return f"{account_id[:4]}****{account_id[-4:]}"
     return "********"
+
+
+def resolve_region(explicit: Optional[str] = None) -> str:
+    """Resolve the AWS region using a consistent, ordered priority chain.
+
+    Priority (highest to lowest):
+    1. Caller-supplied *explicit* value (e.g. from --region CLI flag or P05Config.region).
+    2. ``AWS_REGION`` environment variable (set by CloudShell and most SDKs).
+    3. ``AWS_DEFAULT_REGION`` environment variable (boto3 / CLI convention).
+    4. Hard-coded fallback: ``us-east-1``.
+    """
+    if explicit:
+        return explicit
+    return (
+        os.environ.get("AWS_REGION")
+        or os.environ.get("AWS_DEFAULT_REGION")
+        or _DEFAULT_REGION
+    )
 
 
 class AWSAdapter:
@@ -28,7 +47,7 @@ class AWSAdapter:
         profile_name: Optional[str] = None,
         mock_mode: Optional[bool] = None,
     ) -> None:
-        self._region = region_name or os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+        self._region = resolve_region(region_name)
         self._profile = profile_name or os.environ.get("AWS_PROFILE")
         self._mock_mode = (
             mock_mode if mock_mode is not None

@@ -6,7 +6,7 @@ import typer
 from rich.console import Console
 
 from cloudprac.__version__ import __version__
-from cloudprac.adapters.aws_client import AWSAdapter
+from cloudprac.adapters.aws_client import AWSAdapter, resolve_region
 from cloudprac.adapters.preflight import (
     detect_public_ip,
     is_running_in_cloudshell,
@@ -237,7 +237,7 @@ def run_practical(
 
     config = load_config()
 
-    target_region = region or config.default_region
+    target_region = resolve_region(region) if region else resolve_region(config.default_region)
     adapter = AWSAdapter(region_name=target_region, profile_name=profile)
     engine = ExecutionEngine(config=config, adapter=adapter)
 
@@ -312,7 +312,7 @@ def verify_practical(
         raise typer.Exit(1)
 
     config = load_config()
-    target_region = region or config.default_region
+    target_region = resolve_region(region) if region else resolve_region(config.default_region)
     adapter = AWSAdapter(region_name=target_region, profile_name=profile)
     verifier = VerificationEngine(adapter)
 
@@ -416,7 +416,7 @@ def cleanup_practical(
 def preflight() -> None:
     """Run diagnostics on AWS CloudShell environment, Python, and credentials."""
     config = load_config()
-    adapter = AWSAdapter(region_name=config.default_region)
+    adapter = AWSAdapter(region_name=resolve_region(config.default_region))
     report = run_preflight_checks(adapter)
     print_banner(is_cloudshell=report.is_cloudshell)
     print_preflight_table(report)

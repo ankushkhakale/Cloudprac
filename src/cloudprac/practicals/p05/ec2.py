@@ -44,7 +44,14 @@ def validate_cidr_block(cidr: Optional[str], param_name: str = "app_cidr") -> st
 
 
 def get_default_or_first_vpc(ec2_client: Any) -> Tuple[str, str]:
-    """Find a default VPC and suitable subnet, or fallback to an active VPC."""
+    """Find a default VPC and a subnet that auto-assigns public IPs.
+
+    Returns (vpc_id, subnet_id).  Prefers the default VPC and, within it,
+    a subnet whose ``MapPublicIpOnLaunch`` flag is ``True`` so that EC2
+    instances automatically receive a public IPv4 address.  Falls back to
+    the first available subnet and logs a warning — the caller is responsible
+    for explicitly requesting a public IP at launch time.
+    """
     try:
         vpcs_resp = ec2_client.describe_vpcs(
             Filters=[{"Name": "isDefault", "Values": ["true"]}]
@@ -71,11 +78,24 @@ def get_default_or_first_vpc(ec2_client: Any) -> Tuple[str, str]:
                 f"VPC '{vpc_id}' contains no subnets. At least one subnet is required to launch an EC2 instance."
             )
 
-        subnet_id = subnets[0]["SubnetId"]
+        # Prefer a subnet that auto-assigns public IPs (MapPublicIpOnLaunch=True)
+        public_subnets = [s for s in subnets if s.get("MapPublicIpOnLaunch", False)]
+        if public_subnets:
+            subnet_id = public_subnets[0]["SubnetId"]
+            logger.debug(f"Selected public subnet '{subnet_id}' (MapPublicIpOnLaunch=True) in VPC '{vpc_id}'.")
+        else:
+            subnet_id = subnets[0]["SubnetId"]
+            logger.warning(
+                f"No subnet with MapPublicIpOnLaunch=True found in VPC '{vpc_id}'. "
+                f"Using subnet '{subnet_id}'. A public IP will be explicitly requested at launch "
+                "to ensure external reachability; this requires the subnet to have an Internet Gateway attached."
+            )
+
         return vpc_id, subnet_id
     except ClientError as e:
         logger.error(f"Error querying VPCs/Subnets: {e}")
         raise
+
 
 
 def find_latest_al2023_ami(ec2_client: Any, ssm_client: Optional[Any] = None, architecture: str = "x86_64") -> str:
@@ -477,16 +497,33 @@ def launch_ec2_instance(
     key_name: Optional[str] = None,
     tags: Optional[Dict[str, str]] = None,
 ) -> str:
-    """Launch a single EC2 instance attached to instance profile and user-data script."""
+    """Launch a single EC2 instance attached to instance profile and user-data script.
+
+    Always requests a public IPv4 address via ``AssociatePublicIpAddress=True``
+    on the primary network interface so the instance is reachable regardless of
+    the subnet's ``MapPublicIpOnLaunch`` default setting.  Note that when
+    ``NetworkInterfaces`` is specified, ``SubnetId`` and ``SecurityGroupIds``
+    must be placed on the interface entry, not the top-level ``RunInstances``
+    request — AWS rejects the call otherwise.
+    """
     tag_list = [{"Key": k, "Value": v} for k, v in (tags or {}).items()]
 
+    # Use NetworkInterfaces to explicitly request a public IP.
+    # This overrides the subnet's MapPublicIpOnLaunch attribute, guaranteeing
+    # reachability even in subnets that would otherwise not assign a public IP.
     launch_args: Dict[str, Any] = {
         "ImageId": image_id,
         "InstanceType": instance_type,
         "MinCount": 1,
         "MaxCount": 1,
-        "SubnetId": subnet_id,
-        "SecurityGroupIds": [security_group_id],
+        "NetworkInterfaces": [
+            {
+                "DeviceIndex": 0,
+                "SubnetId": subnet_id,
+                "Groups": [security_group_id],
+                "AssociatePublicIpAddress": True,
+            }
+        ],
         "TagSpecifications": [
             {
                 "ResourceType": "instance",
@@ -513,7 +550,7 @@ def launch_ec2_instance(
     for attempt in range(max_retries):
         try:
             logger.info(
-                f"Launching EC2 instance ({instance_type}, AMI: {image_id})... "
+                f"Launching EC2 instance ({instance_type}, AMI: {image_id}, public-IP=enabled)... "
                 f"(attempt {attempt + 1}/{max_retries})"
             )
             resp = ec2_client.run_instances(**launch_args)
@@ -533,6 +570,7 @@ def launch_ec2_instance(
                 )
                 time.sleep(retry_delay)
                 continue
+
             raise
 
 
@@ -757,7 +795,11 @@ def cleanup_ec2_resources(
                 for _ in range(30):
                     time.sleep(4)
                     desc = ec2_client.describe_instances(InstanceIds=[instance_id])
-                    state = desc["Reservations"][0]["Instances"][0]["State"]["Name"]
+                    reservations = desc.get("Reservations", [])
+                    if not reservations or not reservations[0].get("Instances"):
+                        # Instance no longer visible — treat as terminated
+                        break
+                    state = reservations[0]["Instances"][0].get("State", {}).get("Name", "")
                     if state in ("terminated", "shutting-down"):
                         break
         except ClientError as e:
