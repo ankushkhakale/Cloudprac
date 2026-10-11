@@ -195,7 +195,7 @@ def print_warning(message: str) -> None:
 
 def print_p05_demonstration_guide(
     run_id: str,
-    public_ip: str,
+    public_ip: Optional[str] = None,
     app_port: int = 5000,
     token_file_path: Optional[str] = None,
     key_file_path: Optional[str] = None,
@@ -207,7 +207,15 @@ def print_p05_demonstration_guide(
     Instead, secure administrative operations are demonstrated via encrypted SSH loopback
     or encrypted SSH port-forwarding tunnels.
     """
-    url = f"http://{public_ip}:{app_port}"
+    valid_ip = bool(
+        public_ip
+        and public_ip.strip()
+        and public_ip != "none"
+        and not public_ip.startswith("198.51.100.")
+        and not public_ip.startswith("192.0.2.")
+        and not public_ip.startswith("203.0.113.")
+    )
+    url = f"http://{public_ip}:{app_port}" if valid_ip else ""
     key_disp = key_file_path or f"~/.cloudprac/keys/cloudprac-p05-key-{run_id}.pem"
     token_read = f"cat {token_file_path}" if token_file_path else f"cat ~/.cloudprac/runs/{run_id}/admin_token"
 
@@ -215,19 +223,35 @@ def print_p05_demonstration_guide(
     content.append("🎓 Student Lab Demonstration Guide\n", style="bold green")
     content.append("Your application is operational and sample student records are active in DynamoDB.\n\n", style="white")
 
-    content.append("1. Web Application Public Inspection (Read-Only):\n", style="bold cyan")
-    content.append(f"   URL: {url}\n", style="bold white underline")
-    content.append(f"   Health Check: curl -s {url}/health\n", style="bold yellow")
-    content.append(f"   List Students: curl -s {url}/api/students\n", style="bold yellow")
-    content.append(f"   Retrieve Document: curl -s {url}/api/students/STU-001/document\n\n", style="bold yellow")
+    if not valid_ip:
+        content.append("⚠ Public IP Notice:\n", style="bold yellow")
+        content.append(
+            "   No public IPv4 address is assigned to the EC2 instance in this subnet.\n"
+            "   External HTTP inspection requires an assigned public IPv4 address.\n\n",
+            style="yellow",
+        )
+    else:
+        content.append("1. Web Application Public Inspection (Read-Only):\n", style="bold cyan")
+        content.append(f"   URL: {url}\n", style="bold white underline")
+        content.append(f"   Health Check: curl -s {url}/health\n", style="bold yellow")
+        content.append(f"   List Students: curl -s {url}/api/students\n", style="bold yellow")
+        content.append(f"   Retrieve Document: curl -s {url}/api/students/STU-001/document\n\n", style="bold yellow")
+
+        content.append("   🌐 Browser Web Preview & Access Guidance:\n", style="bold cyan")
+        content.append("   • In-Terminal Access: Run the curl commands above directly inside your CloudShell session.\n", style="white")
+        content.append("   • CloudShell Web Preview: Forward port locally in CloudShell (safely accepts new host key non-interactively):\n", style="white")
+        content.append(f"     ssh -i {key_disp} -o StrictHostKeyChecking=accept-new -N -L 60001:127.0.0.1:{app_port} ec2-user@{public_ip} &\n", style="bold yellow")
+        content.append("     Then click CloudShell 'Web Preview' -> 'Preview on port 60001'.\n", style="dim")
+        content.append("   • Direct Browser Access: Your workstation IP must be allowed in the security group (--app-cidr).\n\n", style="dim")
 
     content.append("2. Secure Authenticated Administration (Encrypted in Transit):\n", style="bold cyan")
     content.append("   🔒 Security Notice: Admin tokens must NEVER be sent over unencrypted HTTP.\n", style="yellow")
     content.append("   Use either of the two encrypted methods below:\n\n", style="dim")
 
+    target_host = public_ip if valid_ip else "<ec2-instance-ip>"
     content.append("   Method A — Encrypted SSH Remote Execution (Zero Overhead):\n", style="bold green")
     content.append(
-        f"   ssh -i {key_disp} ec2-user@{public_ip} \\\n"
+        f"   ssh -i {key_disp} -o StrictHostKeyChecking=accept-new ec2-user@{target_host} \\\n"
         f"     'curl -s -X POST http://127.0.0.1:{app_port}/api/students \\\n"
         f'        -H "Content-Type: application/json" \\\n'
         f"        -H \"X-Admin-Token: $(sudo grep ADMIN_TOKEN /opt/cloudprac/.env | cut -d= -f2)\" \\\n"
@@ -238,7 +262,7 @@ def print_p05_demonstration_guide(
     content.append("   Method B — Encrypted SSH Local Port Forwarding Tunnel:\n", style="bold green")
     content.append(
         f"   # 1. Open encrypted SSH background tunnel\n"
-        f"   ssh -i {key_disp} -N -L {app_port}:127.0.0.1:{app_port} ec2-user@{public_ip} &\n"
+        f"   ssh -i {key_disp} -o StrictHostKeyChecking=accept-new -N -L {app_port}:127.0.0.1:{app_port} ec2-user@{target_host} &\n"
         f"   # 2. Transmit authenticated mutation through encrypted tunnel\n"
         f"   curl -s -X POST http://127.0.0.1:{app_port}/api/students \\\n"
         f'     -H "Content-Type: application/json" \\\n'

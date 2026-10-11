@@ -382,7 +382,7 @@ def test_plan_and_runtime_explicit_region_alignment():
 
     assert res.manifest is not None
     assert res.manifest.aws_region == custom_region
-    assert res.outputs.get("app_url") == f"http://198.51.100.25:{p05.p05_config.app_port}"
+    assert res.outputs.get("app_url") == f"http://54.200.10.25:{p05.p05_config.app_port}"
 
     # 3. Cleaner verifies region match
     cleanup_res = p05.cleanup(res.manifest, adapter)

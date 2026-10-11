@@ -124,7 +124,7 @@ def menu_run_p05() -> None:
     try:
         result = engine.run_practical(
             practical=practical,
-            run_id=plan.run_id,
+            run_id=None,
             auto_verify=True,
             auto_cleanup=False,
         )
@@ -147,7 +147,7 @@ def menu_run_p05() -> None:
 
         # Lab Demonstration Guide
         console.print("\n[bold cyan]─── Step 5: Practical Demonstration Guide ───[/bold cyan]")
-        public_ip = result.outputs.get("public_ip", "198.51.100.25")
+        public_ip = result.outputs.get("public_ip")
         app_port = result.outputs.get("app_port", 5000)
         run_dir = get_run_dir(result.run_id)
         token_file = run_dir / "admin_token"

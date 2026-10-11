@@ -87,21 +87,22 @@ def test_print_p05_demonstration_guide_content():
     with patch("cloudprac.cli.ui.console", test_console):
         print_p05_demonstration_guide(
             run_id="test-run-123",
-            public_ip="198.51.100.50",
+            public_ip="54.200.10.50",
             app_port=5000,
             token_file_path="/tmp/test_token",
         )
 
     output = buffer.getvalue()
     assert "Student Lab Demonstration Guide" in output
-    assert "http://198.51.100.50:5000" in output
-    assert "curl -s http://198.51.100.50:5000/health" in output
-    assert "curl -s http://198.51.100.50:5000/api/students" in output
+    assert "http://54.200.10.50:5000" in output
+    assert "curl -s http://54.200.10.50:5000/health" in output
+    assert "curl -s http://54.200.10.50:5000/api/students" in output
     assert "Admin tokens must NEVER be sent" in output
     assert "Method A" in output
     assert "Method B" in output
     assert "http://127.0.0.1:5000/api/students" in output
-    assert "http://198.51.100.50:5000/api/students -H \"X-Admin-Token:" not in output
+    assert "StrictHostKeyChecking=accept-new" in output
+    assert "http://54.200.10.50:5000/api/students -H \"X-Admin-Token:" not in output
 
     assert "cloudprac report P05 --run-id test-run-123" in output
     assert "cloudprac cleanup P05 --run-id test-run-123" in output
@@ -115,7 +116,7 @@ def test_cli_run_p05_presents_demonstration_guide_in_mock_mode(monkeypatch):
     assert result.exit_code == 0
     assert "Practical P05 executed successfully" in result.output
     assert "Student Lab Demonstration Guide" in result.output
-    assert "curl -s http://198.51.100.25:5000/health" in result.output
+    assert "curl -s http://54.200.10.25:5000/health" in result.output
     assert "cloudprac cleanup P05 --run-id" in result.output
 
 

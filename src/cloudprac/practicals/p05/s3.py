@@ -367,31 +367,129 @@ def cleanup_s3_resources(
             )
             return []
 
-    # 1. Delete tracked objects or all objects if created by run
+    # 1. Delete tracked objects or all objects (including versions and delete markers)
     try:
         if tracked_object_keys:
             objects_to_delete = [{"Key": k} for k in tracked_object_keys]
-            s3_client.delete_objects(
+            del_resp = s3_client.delete_objects(
                 Bucket=bucket_name,
                 Delete={"Objects": objects_to_delete, "Quiet": True},
             )
+            errors = del_resp.get("Errors", [])
+            if errors:
+                err_details = [
+                    f"{e.get('Key')}: {e.get('Code')} ({e.get('Message')})"
+                    for e in errors
+                ]
+                raise RuntimeError(
+                    f"Failed to delete {len(errors)} tracked objects from '{bucket_name}': {', '.join(err_details)}"
+                )
             deleted.extend([f"s3://{bucket_name}/{k}" for k in tracked_object_keys])
-        else:
-            # Drain bucket before deleting
-            resp = s3_client.list_objects_v2(Bucket=bucket_name)
-            contents = resp.get("Contents", [])
-            if contents:
-                objects_to_delete = [{"Key": item["Key"]} for item in contents]
-                s3_client.delete_objects(
+
+        # Drain unversioned objects with pagination
+        continuation_token = None
+        while True:
+            list_kwargs: Dict[str, Any] = {"Bucket": bucket_name}
+            if continuation_token:
+                list_kwargs["ContinuationToken"] = continuation_token
+
+            resp = s3_client.list_objects_v2(**list_kwargs)
+            contents_list = resp.get("Contents", []) if isinstance(resp, dict) or hasattr(resp, "get") else []
+            contents_list = contents_list if isinstance(contents_list, list) else []
+            objects_to_delete = [
+                {"Key": item["Key"]}
+                for item in contents_list
+                if isinstance(item, dict) and "Key" in item
+            ]
+            if objects_to_delete:
+                del_resp = s3_client.delete_objects(
                     Bucket=bucket_name,
                     Delete={"Objects": objects_to_delete, "Quiet": True},
                 )
-                deleted.extend([f"s3://{bucket_name}/{item['Key']}" for item in contents])
+                errors = del_resp.get("Errors", []) if isinstance(del_resp, dict) or hasattr(del_resp, "get") else []
+                errors = errors if isinstance(errors, list) else []
+                if errors:
+                    err_details = [
+                        f"{e.get('Key')}: {e.get('Code')} ({e.get('Message')})"
+                        for e in errors
+                        if isinstance(e, dict)
+                    ]
+                    raise RuntimeError(
+                        f"Failed to delete {len(errors)} objects from '{bucket_name}': {', '.join(err_details)}"
+                    )
+                for item in objects_to_delete:
+                    key_id = f"s3://{bucket_name}/{item['Key']}"
+                    if key_id not in deleted:
+                        deleted.append(key_id)
+
+            if resp.get("IsTruncated") is not True:
+                break
+            continuation_token = resp.get("NextContinuationToken")
+            if not isinstance(continuation_token, str) or not continuation_token:
+                break
+
+        # Drain object versions and delete markers with pagination
+        key_marker = None
+        version_id_marker = None
+        while True:
+            ver_kwargs: Dict[str, Any] = {"Bucket": bucket_name}
+            if key_marker:
+                ver_kwargs["KeyMarker"] = key_marker
+            if version_id_marker:
+                ver_kwargs["VersionIdMarker"] = version_id_marker
+
+            ver_resp = s3_client.list_object_versions(**ver_kwargs)
+            versions_list = ver_resp.get("Versions", []) if isinstance(ver_resp, dict) or hasattr(ver_resp, "get") else []
+            versions_list = versions_list if isinstance(versions_list, list) else []
+            dm_list = ver_resp.get("DeleteMarkers", []) if isinstance(ver_resp, dict) or hasattr(ver_resp, "get") else []
+            dm_list = dm_list if isinstance(dm_list, list) else []
+
+            versions_to_delete = []
+            for ver in versions_list:
+                if isinstance(ver, dict) and "Key" in ver and "VersionId" in ver:
+                    versions_to_delete.append({"Key": ver["Key"], "VersionId": ver["VersionId"]})
+            for dm in dm_list:
+                if isinstance(dm, dict) and "Key" in dm and "VersionId" in dm:
+                    versions_to_delete.append({"Key": dm["Key"], "VersionId": dm["VersionId"]})
+
+            if versions_to_delete:
+                del_resp = s3_client.delete_objects(
+                    Bucket=bucket_name,
+                    Delete={"Objects": versions_to_delete, "Quiet": True},
+                )
+                errors = del_resp.get("Errors", []) if isinstance(del_resp, dict) or hasattr(del_resp, "get") else []
+                errors = errors if isinstance(errors, list) else []
+                if errors:
+                    err_details = [
+                        f"{e.get('Key')} (version {e.get('VersionId')}): {e.get('Code')} ({e.get('Message')})"
+                        for e in errors
+                        if isinstance(e, dict)
+                    ]
+                    raise RuntimeError(
+                        f"Failed to delete {len(errors)} object versions/markers from '{bucket_name}': {', '.join(err_details)}"
+                    )
+                for item in versions_to_delete:
+                    key_id = f"s3://{bucket_name}/{item['Key']}?versionId={item['VersionId']}"
+                    if key_id not in deleted:
+                        deleted.append(key_id)
+
+            if ver_resp.get("IsTruncated") is not True:
+                break
+            key_marker = ver_resp.get("NextKeyMarker")
+            version_id_marker = ver_resp.get("NextVersionIdMarker")
+            if not isinstance(key_marker, str) or not key_marker:
+                break
+
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code")
         if code in ("NoSuchBucket", "NotFound"):
             return []
-        logger.warning(f"Error removing objects from bucket '{bucket_name}': {e}")
+        logger.error(f"Error removing objects from bucket '{bucket_name}': {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Error removing objects/versions from bucket '{bucket_name}': {e}")
+        raise
+
 
     # 2. Delete the bucket
     try:

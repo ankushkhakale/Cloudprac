@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class PracticalStatus(str, Enum):
@@ -148,5 +148,14 @@ class CleanupResult(BaseModel):
         default_factory=lambda: datetime.now(timezone.utc).isoformat()
     )
     resources_deleted: List[str] = Field(default_factory=list)
+    resources_absent: List[str] = Field(default_factory=list)
     resources_failed: List[str] = Field(default_factory=list)
+    resources_unverified: List[str] = Field(default_factory=list)
     errors: List[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_overall_success(self) -> "CleanupResult":
+        """Ensure failed or unverified resources or errors can never produce an overall success."""
+        if (self.resources_failed or self.resources_unverified or self.errors) and self.success:
+            self.success = False
+        return self

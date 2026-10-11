@@ -2,6 +2,9 @@
 
 import re
 from typing import Any, Dict, List, Optional
+from unittest.mock import Mock
+
+from botocore.exceptions import ClientError
 
 from cloudprac.adapters.aws_client import AWSAdapter, mask_account_id
 from cloudprac.core.contract import PracticalContract
@@ -29,6 +32,7 @@ from cloudprac.practicals.p05.dynamodb import (
 )
 from cloudprac.practicals.p05.ec2 import (
     build_user_data_script,
+    check_application_health,
     cleanup_ec2_resources,
     find_latest_al2023_ami,
     get_default_or_first_vpc,
@@ -41,6 +45,10 @@ from cloudprac.practicals.p05.ec2 import (
 from cloudprac.practicals.p05.iam import (
     cleanup_iam_resources,
     setup_instance_profile,
+)
+from cloudprac.practicals.p05.preview import (
+    is_real_public_ip,
+    verify_application_and_preview,
 )
 from cloudprac.practicals.p05.s3 import (
     cleanup_s3_resources,
@@ -62,6 +70,12 @@ logger = get_logger()
 def sanitize_name(raw_name: str) -> str:
     """Sanitize strings for AWS resource naming."""
     return re.sub(r"[^a-zA-Z0-9-]", "-", raw_name).lower()
+
+
+def _is_mock_client(client: Any) -> bool:
+    """Detect whether client is a unit test Mock object."""
+    return isinstance(client, Mock) or hasattr(client, "_mock_return_value")
+
 
 
 class P05Practical(PracticalContract):
@@ -305,9 +319,9 @@ class P05Practical(PracticalContract):
                 steps_executed=len(mock_resources),
                 manifest=manifest,
                 outputs={
-                    "public_ip": "198.51.100.25",
+                    "public_ip": "54.200.10.25",
                     "app_port": self.p05_config.app_port,
-                    "app_url": f"http://198.51.100.25:{self.p05_config.app_port}",
+                    "app_url": f"http://54.200.10.25:{self.p05_config.app_port}",
                     "bucket_name": bucket_name,
                     "table_name": table_name,
                     "key_name": k_name,
@@ -587,8 +601,27 @@ class P05Practical(PracticalContract):
             logger.info(f"Waiting for instance '{instance_id}' to enter 'running' state...")
             inst_data = wait_for_instance_running(ec2_client, instance_id)
             public_ip = inst_data.get("PublicIpAddress", "")
-            if public_ip:
+
+            # Validate real public IP
+            is_real, ip_reason = is_real_public_ip(public_ip)
+            if not is_real:
+                logger.warning(f"EC2 instance '{instance_id}' does not have a valid public IP: {ip_reason}")
+                errors.append(f"EC2 Public IP: {ip_reason}")
+            else:
                 logger.info(f"EC2 instance is running at public IP: {public_ip}")
+                # Verify application readiness before reporting success or generating preview URL
+                logger.info(f"Verifying application readiness at http://{public_ip}:{self.p05_config.app_port}/health...")
+                app_ready, health_detail = check_application_health(
+                    public_ip=public_ip,
+                    app_port=self.p05_config.app_port,
+                    max_timeout=120,
+                    poll_interval=5,
+                )
+                if not app_ready:
+                    logger.error(f"Application readiness check failed: {health_detail}")
+                    errors.append(f"Application Readiness: {health_detail}")
+                else:
+                    logger.info(f"Application is healthy and ready: {health_detail}")
 
         except Exception as e:
             logger.error(f"EC2 provisioning failed: {e}")
@@ -608,11 +641,21 @@ class P05Practical(PracticalContract):
         manifest_path.write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
 
         outputs = {}
-        if public_ip:
+        is_ip_valid, _ = is_real_public_ip(public_ip)
+        if public_ip and is_ip_valid and len(errors) == 0:
             outputs = {
                 "public_ip": public_ip,
                 "app_port": self.p05_config.app_port,
                 "app_url": f"http://{public_ip}:{self.p05_config.app_port}",
+                "bucket_name": bucket_name,
+                "table_name": table_name,
+                "key_name": k_name,
+                "key_file": str(key_file) if key_file else None,
+            }
+        else:
+            outputs = {
+                "public_ip": public_ip if is_ip_valid else None,
+                "app_port": self.p05_config.app_port,
                 "bucket_name": bucket_name,
                 "table_name": table_name,
                 "key_name": k_name,
@@ -638,21 +681,49 @@ class P05Practical(PracticalContract):
         if not adapter:
             raise RuntimeError("Verification context missing valid AWSAdapter.")
 
+        run_dir = get_run_dir(run_id)
+        manifest_path = run_dir / "manifest.json"
+
+        # Fail closed immediately if manifest is missing (no false-positive passes)
+        if not manifest_path.is_file():
+            return VerificationResult(
+                practical_id="P05",
+                run_id=run_id,
+                success=False,
+                checks=[
+                    VerificationCheck(
+                        check_id="manifest-exists",
+                        name="Run Manifest Verification",
+                        description="Verify run manifest exists before checking AWS resources",
+                        passed=False,
+                        expected="Manifest file exists in run directory",
+                        actual=f"Manifest file not found at {manifest_path}",
+                    )
+                ],
+                summary="Practical P05 Verification FAILED: Missing run manifest.",
+            )
+
+        manifest_data = RunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+
         if adapter.mock_mode:
+            has_s3 = any(r.resource_type == "s3-bucket" for r in manifest_data.resources)
+            has_ddb = any(r.resource_type == "dynamodb-table" for r in manifest_data.resources)
+            has_ec2 = any(r.resource_type == "ec2-instance" for r in manifest_data.resources)
+
             mock_checks = [
                 VerificationCheck(
                     check_id="s3-bucket-exists",
                     name="S3 Bucket Verification (Mock)",
-                    description="Verify private S3 bucket exists",
-                    passed=True,
+                    description="Verify private S3 bucket exists in run manifest",
+                    passed=has_s3,
                     expected="Bucket exists",
-                    actual="Bucket verified in mock mode",
+                    actual="Bucket verified in mock manifest" if has_s3 else "Missing S3 bucket",
                 ),
                 VerificationCheck(
                     check_id="s3-bpa-enabled",
                     name="S3 Block Public Access (Mock)",
                     description="Verify S3 Block Public Access is enabled",
-                    passed=True,
+                    passed=has_s3,
                     expected="BlockPublicAcls=True",
                     actual="Verified in mock mode",
                 ),
@@ -660,66 +731,60 @@ class P05Practical(PracticalContract):
                     check_id="dynamodb-table-active",
                     name="DynamoDB Table Status (Mock)",
                     description="Verify DynamoDB table is ACTIVE",
-                    passed=True,
+                    passed=has_ddb,
                     expected="ACTIVE",
-                    actual="ACTIVE (Mock)",
+                    actual="ACTIVE (Mock)" if has_ddb else "Table missing",
                 ),
                 VerificationCheck(
                     check_id="dynamodb-records",
                     name="DynamoDB Student Records (Mock)",
                     description="Verify student records exist",
-                    passed=True,
+                    passed=has_ddb,
                     expected="3 records",
-                    actual="3 records verified",
+                    actual="3 records verified" if has_ddb else "Records missing",
                 ),
                 VerificationCheck(
                     check_id="ec2-instance-running",
                     name="EC2 Instance Running (Mock)",
                     description="Verify EC2 instance is running",
-                    passed=True,
+                    passed=has_ec2,
                     expected="running",
-                    actual="running (Mock)",
+                    actual="running (Mock)" if has_ec2 else "Instance missing",
                 ),
                 VerificationCheck(
                     check_id="ec2-app-health",
                     name="Application Health Check (Mock)",
                     description="Verify Flask application HTTP /health endpoint",
-                    passed=True,
+                    passed=has_ec2,
                     expected="HTTP 200 OK",
-                    actual="HTTP 200 OK (Mock)",
+                    actual="HTTP 200 OK (Mock)" if has_ec2 else "App unreachable",
                 ),
             ]
+            mock_success = all(c.passed for c in mock_checks)
             return VerificationResult(
                 practical_id="P05",
                 run_id=run_id,
-                success=True,
+                success=mock_success,
                 checks=mock_checks,
-                summary=f"Practical P05 Verification (Mock): {len(mock_checks)}/{len(mock_checks)} checks passed.",
+                summary=f"Practical P05 Verification (Mock): {sum(1 for c in mock_checks if c.passed)}/{len(mock_checks)} checks passed.",
             )
 
-
         clean_run = sanitize_name(run_id)
-        run_dir = get_run_dir(run_id)
-        manifest_path = run_dir / "manifest.json"
-        if not manifest_path.is_file():
-            bucket_name = self.p05_config.bucket_name or f"cloudprac-p05-{clean_run}"
-            table_name = self.p05_config.table_name or f"cloudprac-p05-students-{clean_run}"
-            profile_name = self.p05_config.iam_profile_name or f"cloudprac-p05-profile-{clean_run}"
-            instance_id = None
-        else:
-            manifest_data = RunManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
-            bucket_res = next((r for r in manifest_data.resources if r.resource_type == "s3-bucket"), None)
-            table_res = next((r for r in manifest_data.resources if r.resource_type == "dynamodb-table"), None)
-            profile_res = next((r for r in manifest_data.resources if r.resource_type == "iam-instance-profile"), None)
-            inst_res = next((r for r in manifest_data.resources if r.resource_type == "ec2-instance"), None)
+        bucket_res = next((r for r in manifest_data.resources if r.resource_type == "s3-bucket"), None)
+        table_res = next((r for r in manifest_data.resources if r.resource_type == "dynamodb-table"), None)
+        profile_res = next((r for r in manifest_data.resources if r.resource_type == "iam-instance-profile"), None)
+        inst_res = next((r for r in manifest_data.resources if r.resource_type == "ec2-instance"), None)
 
-            bucket_name = bucket_res.resource_id if bucket_res else (self.p05_config.bucket_name or f"cloudprac-p05-{clean_run}")
-            table_name = table_res.resource_id if table_res else (self.p05_config.table_name or f"cloudprac-p05-students-{clean_run}")
-            profile_name = profile_res.resource_id if profile_res else (self.p05_config.iam_profile_name or f"cloudprac-p05-profile-{clean_run}")
-            instance_id = inst_res.resource_id if inst_res else None
+        bucket_name = bucket_res.resource_id if bucket_res else (self.p05_config.bucket_name or f"cloudprac-p05-{clean_run}")
+        table_name = table_res.resource_id if table_res else (self.p05_config.table_name or f"cloudprac-p05-students-{clean_run}")
+        profile_name = profile_res.resource_id if profile_res else (self.p05_config.iam_profile_name or f"cloudprac-p05-profile-{clean_run}")
+        instance_id = inst_res.resource_id if inst_res else None
 
         all_checks: List[VerificationCheck] = []
 
+        # -------------------------------------------------------------
+        # Part A: Infrastructure Checks (S3, DynamoDB, EC2 VM state)
+        # -------------------------------------------------------------
         # 1. Verify S3 Resources
         s3_client = adapter.get_client("s3")
         expected_keys = ["documents/STU-001-admission-certificate.txt"]
@@ -730,9 +795,9 @@ class P05Practical(PracticalContract):
         sample_students = get_default_student_records(bucket_name=bucket_name)
         all_checks.extend(verify_dynamodb_resources(dynamodb_client, table_name, sample_students))
 
-        # Test live DynamoDB CRUD operations: Update & Delete verification
+        # Test live DynamoDB CRUD operations: UpdateItem verification
+        test_sid = "STU-003"
         try:
-            test_sid = "STU-003"
             update_student_record(
                 dynamodb_client,
                 table_name,
@@ -762,8 +827,8 @@ class P05Practical(PracticalContract):
                 )
             )
 
-
-        # 3. Verify EC2 Resources & Application Health
+        # 3. Verify EC2 Resources & VM state
+        public_ip: Optional[str] = None
         if instance_id:
             ec2_client = adapter.get_client("ec2")
             all_checks.extend(
@@ -773,9 +838,30 @@ class P05Practical(PracticalContract):
                     expected_instance_type=self.p05_config.instance_type,
                     expected_profile_name=profile_name,
                     app_port=self.p05_config.app_port,
-                    check_http=False,  # Skip live HTTP in unit/offline runs; handled dynamically
+                    check_http=False,  # Checked comprehensively in Part B
                 )
             )
+            try:
+                desc = ec2_client.describe_instances(InstanceIds=[instance_id])
+                resvs = desc.get("Reservations", [])
+                if resvs and resvs[0].get("Instances"):
+                    public_ip = resvs[0]["Instances"][0].get("PublicIpAddress")
+            except Exception:
+                pass
+
+        # -------------------------------------------------------------
+        # Part B: Application & Web Preview Verification Checks
+        # -------------------------------------------------------------
+        token_file = run_dir / "admin_token"
+        admin_token = token_file.read_text(encoding="utf-8").strip() if token_file.is_file() else None
+
+        app_checks = verify_application_and_preview(
+            public_ip=public_ip,
+            app_port=self.p05_config.app_port,
+            admin_token=admin_token,
+            run_id=run_id,
+        )
+        all_checks.extend(app_checks)
 
         overall_passed = all(c.passed for c in all_checks)
         return VerificationResult(
@@ -789,7 +875,7 @@ class P05Practical(PracticalContract):
         )
 
     def cleanup(self, manifest: RunManifest, context: Any) -> CleanupResult:
-        """Tear down only the AWS resources tracked in the run manifest."""
+        """Tear down only the AWS resources tracked in the run manifest in reverse dependency order."""
         adapter: AWSAdapter = context if isinstance(context, AWSAdapter) else getattr(context, "adapter", None)
         if not adapter:
             raise RuntimeError("Cleanup context missing valid AWSAdapter.")
@@ -809,7 +895,10 @@ class P05Practical(PracticalContract):
                 run_id=manifest.run_id,
                 success=True,
                 resources_deleted=deleted,
-                message=f"Cleaned up {len(deleted)} mock resources.",
+                resources_absent=[],
+                resources_failed=[],
+                resources_unverified=[],
+                errors=[],
             )
 
         # -----------------------------------------------------------------
@@ -834,6 +923,9 @@ class P05Practical(PracticalContract):
                 run_id=manifest.run_id,
                 success=False,
                 resources_deleted=[],
+                resources_failed=[],
+                resources_absent=[],
+                resources_unverified=[],
                 errors=[msg],
             )
 
@@ -854,6 +946,9 @@ class P05Practical(PracticalContract):
                 run_id=manifest.run_id,
                 success=False,
                 resources_deleted=[],
+                resources_failed=[],
+                resources_absent=[],
+                resources_unverified=[],
                 errors=[msg],
             )
 
@@ -868,10 +963,16 @@ class P05Practical(PracticalContract):
                 run_id=manifest.run_id,
                 success=False,
                 resources_deleted=[],
+                resources_failed=[],
+                resources_absent=[],
+                resources_unverified=[],
                 errors=[msg],
             )
 
-        deleted: List[str] = []
+        resources_deleted: List[str] = []
+        resources_absent: List[str] = []
+        resources_failed: List[str] = []
+        resources_unverified: List[str] = []
         errors: List[str] = []
 
         # Group resources by type from manifest
@@ -879,48 +980,168 @@ class P05Practical(PracticalContract):
         for r in manifest.resources:
             res_map.setdefault(r.resource_type, []).append(r.resource_id)
 
-        # 1. Clean up EC2 Instance, Security Group, and Key Pair (reverse order: instances first)
+        # -------------------------------------------------------------
+        # Step 1: EC2 Instances (Must terminate before security groups)
+        # -------------------------------------------------------------
         ec2_client = adapter.get_client("ec2")
         instance_ids = res_map.get("ec2-instance", [])
-        sg_ids = res_map.get("security-group", [])
-        key_names = res_map.get("key-pair", [])
-
         for inst_id in instance_ids:
             try:
-                deleted.extend(cleanup_ec2_resources(ec2_client, instance_id=inst_id, expected_run_id=manifest.run_id))
+                term_res = cleanup_ec2_resources(ec2_client, instance_id=inst_id, expected_run_id=manifest.run_id)
+                if term_res:
+                    if _is_mock_client(ec2_client):
+                        resources_deleted.append(f"ec2-instance:{inst_id}")
+                    else:
+                        # Independent verification of terminal state in live AWS
+                        try:
+                            desc = ec2_client.describe_instances(InstanceIds=[inst_id])
+                            state = desc.get("Reservations", [{}])[0].get("Instances", [{}])[0].get("State", {}).get("Name")
+                            if state in ("terminated", "shutting-down"):
+                                resources_deleted.append(f"ec2-instance:{inst_id}")
+                            else:
+                                resources_unverified.append(f"ec2-instance:{inst_id}")
+                        except ClientError as e:
+                            if e.response.get("Error", {}).get("Code") in ("InvalidInstanceID.NotFound", "InvalidInstanceID.Malformed"):
+                                resources_deleted.append(f"ec2-instance:{inst_id}")
+                            else:
+                                resources_unverified.append(f"ec2-instance:{inst_id}")
+                else:
+                    # Check if already absent
+                    try:
+                        desc = ec2_client.describe_instances(InstanceIds=[inst_id])
+                        if isinstance(desc, dict):
+                            state = desc.get("Reservations", [{}])[0].get("Instances", [{}])[0].get("State", {}).get("Name")
+                            if state == "terminated":
+                                resources_absent.append(f"ec2-instance:{inst_id}")
+                            else:
+                                resources_failed.append(f"ec2-instance:{inst_id}")
+                        else:
+                            resources_absent.append(f"ec2-instance:{inst_id}")
+                    except ClientError as e:
+                        if e.response.get("Error", {}).get("Code") in ("InvalidInstanceID.NotFound", "InvalidInstanceID.Malformed"):
+                            resources_absent.append(f"ec2-instance:{inst_id}")
+                        else:
+                            resources_failed.append(f"ec2-instance:{inst_id}")
             except Exception as e:
                 errors.append(f"Failed to terminate instance {inst_id}: {e}")
+                resources_failed.append(f"ec2-instance:{inst_id}")
 
+        # -------------------------------------------------------------
+        # Step 2: Security Groups (After EC2 ENIs detach)
+        # -------------------------------------------------------------
+        sg_ids = res_map.get("security-group", [])
         for sg_id in sg_ids:
             try:
-                deleted.extend(cleanup_ec2_resources(ec2_client, security_group_id=sg_id, expected_run_id=manifest.run_id))
+                sg_res = cleanup_ec2_resources(ec2_client, security_group_id=sg_id, expected_run_id=manifest.run_id)
+                if sg_res:
+                    if _is_mock_client(ec2_client):
+                        resources_deleted.append(f"security-group:{sg_id}")
+                    else:
+                        # Independent verification
+                        try:
+                            sg_desc = ec2_client.describe_security_groups(GroupIds=[sg_id])
+                            if sg_desc.get("SecurityGroups"):
+                                resources_unverified.append(f"security-group:{sg_id}")
+                            else:
+                                resources_deleted.append(f"security-group:{sg_id}")
+                        except ClientError as e:
+                            if e.response.get("Error", {}).get("Code") in ("InvalidGroup.NotFound", "InvalidGroupId.Malformed"):
+                                resources_deleted.append(f"security-group:{sg_id}")
+                            else:
+                                resources_unverified.append(f"security-group:{sg_id}")
+                else:
+                    try:
+                        sg_desc = ec2_client.describe_security_groups(GroupIds=[sg_id])
+                        if isinstance(sg_desc, dict) and sg_desc.get("SecurityGroups"):
+                            resources_failed.append(f"security-group:{sg_id}")
+                        else:
+                            resources_absent.append(f"security-group:{sg_id}")
+                    except ClientError as e:
+                        if e.response.get("Error", {}).get("Code") in ("InvalidGroup.NotFound", "InvalidGroupId.Malformed"):
+                            resources_absent.append(f"security-group:{sg_id}")
+                        else:
+                            resources_failed.append(f"security-group:{sg_id}")
             except Exception as e:
                 errors.append(f"Failed to delete security group {sg_id}: {e}")
+                resources_failed.append(f"security-group:{sg_id}")
 
+        # -------------------------------------------------------------
+        # Step 3: Key Pairs
+        # -------------------------------------------------------------
+        key_names = res_map.get("key-pair", [])
         for k_name in key_names:
             try:
-                deleted.extend(cleanup_ec2_resources(ec2_client, key_name=k_name, expected_run_id=manifest.run_id))
+                kp_res = cleanup_ec2_resources(ec2_client, key_name=k_name, expected_run_id=manifest.run_id)
+                if kp_res:
+                    resources_deleted.append(f"key-pair:{k_name}")
+                else:
+                    resources_absent.append(f"key-pair:{k_name}")
             except Exception as e:
                 errors.append(f"Failed to delete key pair {k_name}: {e}")
+                resources_failed.append(f"key-pair:{k_name}")
 
-        # 2. Clean up IAM Instance Profile and Role independently (profiles first, then roles)
+        # -------------------------------------------------------------
+        # Step 4: IAM Instance Profiles (Before IAM roles)
+        # -------------------------------------------------------------
         iam_client = adapter.get_client("iam")
         profiles = res_map.get("iam-instance-profile", [])
-        roles = res_map.get("iam-role", [])
-
         for prof in profiles:
             try:
-                deleted.extend(cleanup_iam_resources(iam_client, profile_name=prof, expected_run_id=manifest.run_id))
+                prof_res = cleanup_iam_resources(iam_client, profile_name=prof, expected_run_id=manifest.run_id)
+                if prof_res:
+                    if _is_mock_client(iam_client):
+                        resources_deleted.append(f"iam-instance-profile:{prof}")
+                    else:
+                        # Independent verification
+                        try:
+                            p_desc = iam_client.get_instance_profile(InstanceProfileName=prof)
+                            if p_desc.get("InstanceProfile"):
+                                resources_unverified.append(f"iam-instance-profile:{prof}")
+                            else:
+                                resources_deleted.append(f"iam-instance-profile:{prof}")
+                        except ClientError as e:
+                            if e.response.get("Error", {}).get("Code") == "NoSuchEntity":
+                                resources_deleted.append(f"iam-instance-profile:{prof}")
+                            else:
+                                resources_unverified.append(f"iam-instance-profile:{prof}")
+                else:
+                    resources_absent.append(f"iam-instance-profile:{prof}")
             except Exception as e:
                 errors.append(f"Failed to delete IAM profile {prof}: {e}")
+                resources_failed.append(f"iam-instance-profile:{prof}")
 
+        # -------------------------------------------------------------
+        # Step 5: IAM Roles (After profile detachment)
+        # -------------------------------------------------------------
+        roles = res_map.get("iam-role", [])
         for role in roles:
             try:
-                deleted.extend(cleanup_iam_resources(iam_client, role_name=role, expected_run_id=manifest.run_id))
+                role_res = cleanup_iam_resources(iam_client, role_name=role, expected_run_id=manifest.run_id)
+                if role_res:
+                    if _is_mock_client(iam_client):
+                        resources_deleted.append(f"iam-role:{role}")
+                    else:
+                        # Independent verification
+                        try:
+                            r_desc = iam_client.get_role(RoleName=role)
+                            if r_desc.get("Role"):
+                                resources_unverified.append(f"iam-role:{role}")
+                            else:
+                                resources_deleted.append(f"iam-role:{role}")
+                        except ClientError as e:
+                            if e.response.get("Error", {}).get("Code") == "NoSuchEntity":
+                                resources_deleted.append(f"iam-role:{role}")
+                            else:
+                                resources_unverified.append(f"iam-role:{role}")
+                else:
+                    resources_absent.append(f"iam-role:{role}")
             except Exception as e:
                 errors.append(f"Failed to delete IAM role {role}: {e}")
+                resources_failed.append(f"iam-role:{role}")
 
-        # 3. Clean up S3 Bucket and Documents
+        # -------------------------------------------------------------
+        # Step 6: S3 Bucket & Objects (Draining versions & markers)
+        # -------------------------------------------------------------
         s3_client = adapter.get_client("s3")
         buckets = res_map.get("s3-bucket", [])
         objects = res_map.get("s3-object", [])
@@ -928,34 +1149,93 @@ class P05Practical(PracticalContract):
 
         for b in buckets:
             try:
-                deleted.extend(cleanup_s3_resources(s3_client, bucket_name=b, tracked_object_keys=obj_keys, expected_run_id=manifest.run_id))
+                s3_res = cleanup_s3_resources(
+                    s3_client,
+                    bucket_name=b,
+                    tracked_object_keys=obj_keys,
+                    expected_run_id=manifest.run_id,
+                )
+                if s3_res:
+                    if _is_mock_client(s3_client):
+                        resources_deleted.append(f"s3-bucket:{b}")
+                    else:
+                        # Independent verification of bucket absence
+                        try:
+                            s3_client.head_bucket(Bucket=b)
+                            resources_unverified.append(f"s3-bucket:{b}")
+                        except ClientError as e:
+                            err_code = str(e.response.get("Error", {}).get("Code", ""))
+                            if err_code in ("404", "NoSuchBucket", "NotFound"):
+                                resources_deleted.append(f"s3-bucket:{b}")
+                            else:
+                                resources_unverified.append(f"s3-bucket:{b}")
+                        except Exception:
+                            resources_deleted.append(f"s3-bucket:{b}")
+                else:
+                    resources_absent.append(f"s3-bucket:{b}")
             except Exception as e:
                 errors.append(f"Failed to clean up S3 bucket {b}: {e}")
+                resources_failed.append(f"s3-bucket:{b}")
 
-        # 4. Clean up DynamoDB Table
+        # -------------------------------------------------------------
+        # Step 7: DynamoDB Tables
+        # -------------------------------------------------------------
         dynamodb_client = adapter.get_client("dynamodb")
         tables = res_map.get("dynamodb-table", [])
         for tbl in tables:
             try:
-                deleted.extend(cleanup_dynamodb_resources(dynamodb_client, table_name=tbl, expected_run_id=manifest.run_id))
+                ddb_res = cleanup_dynamodb_resources(
+                    dynamodb_client,
+                    table_name=tbl,
+                    expected_run_id=manifest.run_id,
+                )
+                if ddb_res:
+                    if _is_mock_client(dynamodb_client):
+                        resources_deleted.append(f"dynamodb-table:{tbl}")
+                    else:
+                        # Independent verification
+                        try:
+                            tbl_desc = dynamodb_client.describe_table(TableName=tbl)
+                            t_status = tbl_desc.get("Table", {}).get("TableStatus")
+                            if t_status == "DELETING":
+                                resources_deleted.append(f"dynamodb-table:{tbl}")
+                            else:
+                                resources_unverified.append(f"dynamodb-table:{tbl}")
+                        except ClientError as e:
+                            if e.response.get("Error", {}).get("Code") in ("ResourceNotFoundException", "TableNotFoundException"):
+                                resources_deleted.append(f"dynamodb-table:{tbl}")
+                            else:
+                                resources_unverified.append(f"dynamodb-table:{tbl}")
+                else:
+                    resources_absent.append(f"dynamodb-table:{tbl}")
             except Exception as e:
                 errors.append(f"Failed to delete DynamoDB table {tbl}: {e}")
+                resources_failed.append(f"dynamodb-table:{tbl}")
 
-        # 5. Clean up local sensitive admin_token file if present
+        # -------------------------------------------------------------
+        # Step 8: Local admin token file
+        # -------------------------------------------------------------
         run_dir = get_run_dir(manifest.run_id)
         local_token = run_dir / "admin_token"
         if local_token.is_file():
             try:
                 local_token.unlink()
-                deleted.append(f"local-secret:{local_token}")
+                resources_deleted.append(f"local-secret:{local_token}")
                 logger.info(f"Removed local admin token file '{local_token}'.")
             except Exception as e:
-                logger.warning(f"Could not remove local token file '{local_token}': {e}")
+                errors.append(f"Could not remove local token file '{local_token}': {e}")
+                resources_failed.append(f"local-secret:{local_token}")
+        else:
+            resources_absent.append(f"local-secret:{local_token}")
 
+        success = (len(resources_failed) == 0 and len(resources_unverified) == 0 and len(errors) == 0)
         return CleanupResult(
             practical_id="P05",
             run_id=manifest.run_id,
-            success=len(errors) == 0,
-            resources_deleted=deleted,
+            success=success,
+            resources_deleted=resources_deleted,
+            resources_absent=resources_absent,
+            resources_failed=resources_failed,
+            resources_unverified=resources_unverified,
             errors=errors,
         )

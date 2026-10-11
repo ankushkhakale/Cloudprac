@@ -30,12 +30,14 @@ class CleanupEngine:
 
         if not manifest_file.is_file():
             return CleanupResult(
-                success=True,
+                success=False,
                 run_id=run_id,
                 practical_id=practical.metadata.id,
                 resources_deleted=[],
+                resources_absent=[],
                 resources_failed=[],
-                errors=[f"No manifest found for run {run_id}. No tracked resources to clean up."],
+                resources_unverified=[],
+                errors=[f"No manifest found for run '{run_id}'. Refusing unmanifested cleanup."],
             )
 
         try:
@@ -53,6 +55,10 @@ class CleanupEngine:
             )
 
         result = practical.cleanup(manifest, self.context)
+
+        # Enforce that failed or unverified resources or errors can never produce an overall cleanup success
+        if result.resources_failed or result.resources_unverified or result.errors:
+            result.success = False
 
         # Save cleanup result to run directory
         cleanup_file = run_dir / "cleanup.json"

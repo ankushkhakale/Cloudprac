@@ -508,10 +508,32 @@ def launch_ec2_instance(
     if user_data_script:
         launch_args["UserData"] = user_data_script
 
-    logger.info(f"Launching EC2 instance ({instance_type}, AMI: {image_id})...")
-    resp = ec2_client.run_instances(**launch_args)
-    instance_id = resp["Instances"][0]["InstanceId"]
-    return instance_id
+    max_retries = 8
+    retry_delay = 5
+    for attempt in range(max_retries):
+        try:
+            logger.info(
+                f"Launching EC2 instance ({instance_type}, AMI: {image_id})... "
+                f"(attempt {attempt + 1}/{max_retries})"
+            )
+            resp = ec2_client.run_instances(**launch_args)
+            instance_id = resp["Instances"][0]["InstanceId"]
+            return instance_id
+        except ClientError as e:
+            err_msg = str(e)
+            err_code = e.response.get("Error", {}).get("Code", "")
+            if (
+                err_code == "InvalidParameterValue"
+                and ("iamInstanceProfile" in err_msg or "Invalid IAM Instance Profile" in err_msg)
+                and attempt < max_retries - 1
+            ):
+                logger.warning(
+                    f"IAM Instance Profile '{instance_profile_name}' is not yet available to EC2 ({e}). "
+                    f"Retrying in {retry_delay}s (IAM eventual consistency)..."
+                )
+                time.sleep(retry_delay)
+                continue
+            raise
 
 
 def wait_for_instance_running(ec2_client: Any, instance_id: str, max_timeout: int = 180) -> Dict[str, Any]:

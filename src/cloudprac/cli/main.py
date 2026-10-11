@@ -256,14 +256,14 @@ def run_practical(
     try:
         result = engine.run_practical(
             practical=practical,
-            run_id=plan.run_id,
+            run_id=None,
             auto_verify=not no_verify,
             auto_cleanup=auto_cleanup,
         )
         if result.success:
             print_success(f"Practical {pid} executed successfully. Run ID: {result.run_id}")
             if pid.upper() == "P05":
-                public_ip = result.outputs.get("public_ip", "198.51.100.25")
+                public_ip = result.outputs.get("public_ip")
                 app_port = result.outputs.get(
                     "app_port", getattr(getattr(practical, "p05_config", None), "app_port", 5000)
                 )

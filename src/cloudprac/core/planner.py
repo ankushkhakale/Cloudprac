@@ -18,6 +18,13 @@ def generate_run_id(practical_id: str) -> str:
     return f"{practical_id.upper()}-{now_str}-{short_uuid}"
 
 
+def generate_plan_id(practical_id: str) -> str:
+    """Generate a distinct dry-run execution plan identifier."""
+    now_str = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    short_uuid = uuid.uuid4().hex[:6]
+    return f"PLAN-{practical_id.upper()}-{now_str}-{short_uuid}"
+
+
 class ExecutionPlanner:
     """Generates and manages dry-run execution plans."""
 
@@ -37,8 +44,7 @@ class ExecutionPlanner:
                 "Cannot generate an execution plan until syllabus instructions are provided."
             )
 
-
-        active_run_id = run_id or generate_run_id(practical.metadata.id)
+        active_run_id = run_id or generate_plan_id(practical.metadata.id)
         plan = practical.plan(self.config, active_run_id)
 
         # Persist plan to run directory

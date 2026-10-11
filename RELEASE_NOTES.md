@@ -14,7 +14,15 @@ CloudPrac is an AWS Cloud Computing Practical Automation Engine engineered speci
   - Secure out-of-band admin token generation and delivery via private S3 and local restricted files (`0600`).
 - **Interactive Student Lab Demonstration Guide**: Formatted panel presenting exact `curl` commands to test API health, query DynamoDB records, test authenticated student creation, retrieve S3 documents, and clean up.
 - **Run Discovery & Cleanup**: Discovers previous runs from `~/.cloudprac/runs/`, displays resource counts, and allows one-click guarded teardown.
-- **Comprehensive Offline Test Suite**: 67 automated unit and integration tests covering positive flows, network failures, timeouts, ownership validation, and security boundaries.
+- **Reliability & Resilience Hardening**:
+  - IAM instance profile propagation retry in EC2 provisioning to absorb AWS eventual consistency delays.
+  - Application readiness validation before reporting deployment success or exposing preview endpoints.
+  - Elimination of RFC 5737 placeholder IPs (`198.51.100.25`) with strict `is_real_public_ip` validation.
+  - CloudShell Web Preview SSH tunnel guidance (`ssh -N -L 60001:127.0.0.1:5000`) for seamless in-browser lab evaluations.
+  - End-to-end verification covering infrastructure, application `/health`, sample reads, authenticated mutations via `X-Admin-Token`, and read-back validation.
+  - Strict cleanup lifecycle in reverse dependency order with S3 version/delete-marker draining, independent terminal-state AWS queries, and explicit separation of `deleted`, `absent`, `failed`, and `unverified` resources.
+  - Distinct `PLAN-P05-...` IDs vs execution `run_id`s with checkpointed partial manifests to safeguard interrupted runs.
+- **Comprehensive Offline Test Suite**: 96 automated unit and integration tests covering positive flows, network failures, timeouts, ownership validation, and security boundaries.
 
 ## Current Limitations & Notes
 

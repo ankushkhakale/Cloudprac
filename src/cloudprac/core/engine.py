@@ -10,6 +10,7 @@ from cloudprac.core.models import (
     CleanupResult,
     ExecutionResult,
     PracticalStatus,
+    RunManifest,
     VerificationResult,
 )
 from cloudprac.core.planner import ExecutionPlanner, generate_run_id
@@ -58,9 +59,29 @@ class ExecutionEngine:
         plan = self.planner.plan(practical, active_run_id)
 
         # 2. Execute
-        exec_result = practical.execute(plan, self.adapter)
         run_dir = get_run_dir(active_run_id)
         run_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            exec_result = practical.execute(plan, self.adapter)
+        except Exception as e:
+            logger.error(f"Practical execution failed with exception: {e}")
+            manifest = None
+            manifest_file = run_dir / "manifest.json"
+            if manifest_file.is_file():
+                try:
+                    manifest = RunManifest.model_validate_json(manifest_file.read_text(encoding="utf-8"))
+                except Exception:
+                    pass
+            exec_result = ExecutionResult(
+                practical_id=practical.metadata.id,
+                run_id=active_run_id,
+                success=False,
+                message=f"Execution failed or was interrupted: {e}",
+                steps_executed=len(manifest.resources) if manifest else 0,
+                errors=[str(e)],
+                manifest=manifest,
+                outputs={},
+            )
 
         if exec_result.manifest:
             manifest_file = run_dir / "manifest.json"

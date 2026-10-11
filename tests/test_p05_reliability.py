@@ -1,0 +1,479 @@
+"""Comprehensive reliability, preview, verification, and cleanup regression tests for P05."""
+
+import socket
+import urllib.error
+from unittest.mock import MagicMock, patch
+
+import pytest
+from botocore.exceptions import ClientError
+
+from cloudprac.adapters.aws_client import AWSAdapter
+from cloudprac.core.engine import ExecutionEngine
+from cloudprac.core.models import CleanupResult, RunManifest, TrackedResource
+from cloudprac.core.planner import generate_plan_id
+from cloudprac.practicals.p05.ec2 import launch_ec2_instance
+from cloudprac.practicals.p05.practical import P05Practical
+from cloudprac.practicals.p05.preview import (
+    is_real_public_ip,
+    probe_endpoint,
+    sanitize_url_for_logging,
+    verify_application_and_preview,
+)
+from cloudprac.practicals.p05.s3 import cleanup_s3_resources
+from cloudprac.utils.config import CloudPracConfig
+
+# ==============================================================================
+# 1. Real Public IP Assignment & Rejection of Placeholders
+# ==============================================================================
+
+
+def test_is_real_public_ip_rejects_placeholders_and_invalid_formats():
+    """Verify that RFC 5737 testnets, private IPs, loopbacks, and invalid strings are strictly rejected."""
+    # Placeholders / Testnets (RFC 5737)
+    for placeholder in ["198.51.100.25", "198.51.100.1", "192.0.2.1", "203.0.113.50"]:
+        is_valid, reason = is_real_public_ip(placeholder)
+        assert is_valid is False
+        assert "Placeholder / documentation testnet" in reason
+
+    # Private RFC 1918 addresses
+    for priv in ["10.0.0.1", "172.16.0.20", "192.168.1.100"]:
+        is_valid, reason = is_real_public_ip(priv)
+        assert is_valid is False
+        assert "Private RFC1918 address" in reason
+
+    # Loopback
+    is_valid, reason = is_real_public_ip("127.0.0.1")
+    assert is_valid is False
+    assert "Loopback address" in reason
+
+    # Missing / None / undefined strings
+    for empty_val in [None, "", "   ", "none", "None", "null", "undefined"]:
+        is_valid, reason = is_real_public_ip(empty_val)
+        assert is_valid is False
+
+    # Valid public IPv4 addresses
+    for valid_ip in ["54.200.10.25", "3.80.20.1", "13.234.50.12", "142.250.190.46"]:
+        is_valid, reason = is_real_public_ip(valid_ip)
+        assert is_valid is True
+        assert "Valid public IPv4 address" in reason
+
+
+# ==============================================================================
+# 2. Resilient HTTP Endpoint Probing & URL Sanitization
+# ==============================================================================
+
+
+def test_probe_endpoint_handles_timeouts_and_crashes_gracefully():
+    """Verify probe_endpoint captures network timeouts, refusal, and HTTP errors without throwing unhandled exceptions."""
+    # 1. Connection Refused
+    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError(ConnectionRefusedError("Connection refused"))):
+        ok, code, msg, body = probe_endpoint("http://54.200.10.25:5000/health", timeout=1.0)
+        assert ok is False
+        assert code == 0
+        assert "Connection refused" in msg
+        assert body is None
+
+    # 2. Socket Timeout
+    with patch("urllib.request.urlopen", side_effect=socket.timeout("timed out")):
+        ok, code, msg, body = probe_endpoint("http://54.200.10.25:5000/health", timeout=2.0)
+        assert ok is False
+        assert code == 0
+        assert "Socket timed out" in msg
+
+    # 3. HTTP 500 Internal Server Error
+    mock_err = urllib.error.HTTPError(
+        url="http://54.200.10.25:5000/api/students",
+        code=500,
+        msg="Internal Server Error",
+        hdrs={},
+        fp=None,
+    )
+    with patch("urllib.request.urlopen", side_effect=mock_err):
+        ok, code, msg, body = probe_endpoint("http://54.200.10.25:5000/api/students")
+        assert ok is False
+        assert code == 500
+        assert "HTTP 500" in msg
+
+
+def test_sanitize_url_for_logging_redacts_tokens_and_credentials():
+    """Verify URLs with embedded tokens or passwords have sensitive fragments redacted before logging."""
+    url1 = "http://54.200.10.25:5000/api/students?admin_token=secret123&format=json"
+    clean1 = sanitize_url_for_logging(url1)
+    assert "secret123" not in clean1
+    assert "admin_token=[REDACTED]" in clean1
+    assert "format=json" in clean1
+
+    url2 = "http://admin:supersecret@54.200.10.25:5000/dashboard"
+    clean2 = sanitize_url_for_logging(url2)
+    assert "supersecret" not in clean2
+    assert "***@54.200.10.25:5000" in clean2
+
+
+# ==============================================================================
+# 3. Application & Preview Verification Workflow
+# ==============================================================================
+
+
+def test_verify_application_and_preview_fails_immediately_on_placeholder_or_missing_ip():
+    """Verify that when no valid public IP is assigned, all preview checks fail without attempting network traffic."""
+    # Missing IP
+    checks = verify_application_and_preview(public_ip=None, app_port=5000)
+    assert len(checks) >= 6
+    assert all(c.passed is False for c in checks)
+    assert checks[0].check_id == "ec2-public-ip-assigned"
+    assert "No IP address assigned" in checks[0].actual
+    assert any("Skipped: No real public IP assigned" in c.actual for c in checks[1:])
+
+    # Placeholder IP
+    checks_placeholder = verify_application_and_preview(public_ip="198.51.100.25", app_port=5000)
+    assert checks_placeholder[0].passed is False
+    assert "Placeholder / documentation testnet" in checks_placeholder[0].actual
+
+
+def test_verify_application_and_preview_full_successful_suite():
+    """Verify that verify_application_and_preview executes the full suite: preview, /health, read, auth mutation, read-back."""
+    valid_ip = "54.200.10.25"
+    admin_token = "secure-unique-admin-token-xyz-12345"
+
+    def mock_probe(url, method="GET", headers=None, data=None, timeout=5.0):
+        if url.endswith("/health"):
+            return True, 200, "HTTP 200 OK", {"status": "healthy"}
+        if url.endswith("/api/students") and method == "GET":
+            return True, 200, "HTTP 200 OK", {"students": [{"student_id": "STU-001", "name": "Alice"}]}
+        if url.endswith("/api/students/STU-001") and method == "GET":
+            return True, 200, "HTTP 200 OK", {"student_id": "STU-001", "name": "Alice"}
+        if url.endswith("/api/students") and method == "POST":
+            # Assert admin token header was sent
+            assert headers.get("X-Admin-Token") == admin_token
+            return True, 201, "HTTP 201 Created", {"message": "Created"}
+        if "/api/students/VERIF-" in url and method == "GET":
+            sid = url.split("/")[-1]
+            return True, 200, "HTTP 200 OK", {"student_id": sid, "name": "Verification Student"}
+        if "/api/students/VERIF-" in url and method == "DELETE":
+            return True, 200, "HTTP 200 OK", {"message": "Deleted"}
+        if url.endswith("/"):
+            return True, 200, "HTTP 200 OK", None
+        return True, 200, "HTTP 200 OK", None
+
+    with patch("cloudprac.practicals.p05.preview.probe_endpoint", side_effect=mock_probe):
+        checks = verify_application_and_preview(
+            public_ip=valid_ip,
+            app_port=5000,
+            admin_token=admin_token,
+            run_id="test-run-99",
+        )
+
+        assert len(checks) == 7
+        assert all(c.passed is True for c in checks)
+        check_ids = [c.check_id for c in checks]
+        assert "ec2-public-ip-assigned" in check_ids
+        assert "preview-endpoint-accessible" in check_ids
+        assert "app-health-check" in check_ids
+        assert "app-read-students" in check_ids
+        assert "app-read-single-student" in check_ids
+        assert "app-auth-mutation" in check_ids
+        assert "app-mutation-readback" in check_ids
+
+
+# ==============================================================================
+# 4. Distinct Plan IDs vs Execution Run IDs
+# ==============================================================================
+
+
+def test_distinct_plan_id_and_run_id_separation():
+    """Verify planner generates PLAN-P05-... IDs and execution generates distinct run IDs."""
+    plan_id = generate_plan_id("P05")
+    assert plan_id.startswith("PLAN-P05-")
+
+    p05 = P05Practical()
+    config = CloudPracConfig()
+    adapter = AWSAdapter(mock_mode=True)
+    engine = ExecutionEngine(config=config, adapter=adapter)
+    plan = engine.planner.plan(p05)
+
+    assert plan.run_id.startswith("PLAN-P05-")
+
+    # When engine executes, a fresh execution run_id is generated
+    res = engine.run_practical(p05, run_id=None, auto_verify=False, auto_cleanup=False)
+
+    assert res.run_id.startswith("P05-")
+    assert not res.run_id.startswith("PLAN-")
+    assert res.run_id != plan.run_id
+
+
+# ==============================================================================
+# 5. Verification Fails Closed on Missing Run Manifest
+# ==============================================================================
+
+
+def test_verify_fails_closed_when_manifest_missing_in_mock_and_live_modes():
+    """Verify that calling verify on a nonexistent run ID fails closed without false positive mock passes."""
+    p05 = P05Practical()
+
+    # Mock mode
+    mock_adapter = AWSAdapter(mock_mode=True)
+    res_mock = p05.verify("nonexistent-run-id-999", mock_adapter)
+    assert res_mock.success is False
+    assert len(res_mock.checks) == 1
+    assert res_mock.checks[0].check_id == "manifest-exists"
+    assert res_mock.checks[0].passed is False
+
+    # Live mode
+    live_adapter = AWSAdapter(mock_mode=False)
+    live_adapter.get_caller_identity = MagicMock(return_value={"Account": "123456789012"})
+    res_live = p05.verify("nonexistent-run-id-999", live_adapter)
+    assert res_live.success is False
+    assert res_live.checks[0].passed is False
+
+
+# ==============================================================================
+# 6. EC2 IAM Instance Profile Eventual Consistency Retry
+# ==============================================================================
+
+
+def test_launch_ec2_instance_retries_on_iam_eventual_consistency():
+    """Verify launch_ec2_instance catches InvalidParameterValue for iamInstanceProfile and retries."""
+    mock_ec2 = MagicMock()
+
+    # First call raises InvalidParameterValue due to IAM propagation delay
+    # Second call succeeds
+    error_response = {
+        "Error": {
+            "Code": "InvalidParameterValue",
+            "Message": "Value (cloudprac-p05-profile) for parameter iamInstanceProfile.name is invalid. Invalid IAM Instance Profile name",
+        }
+    }
+    client_error = ClientError(error_response, "RunInstances")
+
+    mock_ec2.run_instances.side_effect = [
+        client_error,
+        {"Instances": [{"InstanceId": "i-propagated123"}]},
+    ]
+
+    with patch("time.sleep", return_value=None):
+        inst_id = launch_ec2_instance(
+            ec2_client=mock_ec2,
+            image_id="ami-12345",
+            instance_type="t2.micro",
+            subnet_id="subnet-123",
+            security_group_id="sg-123",
+            instance_profile_name="cloudprac-p05-profile",
+        )
+
+    assert inst_id == "i-propagated123"
+    assert mock_ec2.run_instances.call_count == 2
+
+
+# ==============================================================================
+# 7. Cleanup Absence, Deletion, and Unverified State Separation
+# ==============================================================================
+
+
+def test_cleanup_separates_absent_deleted_and_unverified_resources():
+    """Verify cleanup distinguishes already absent resources from deleted ones and reports unverified state."""
+    p05 = P05Practical()
+
+    manifest = RunManifest(
+        practical_id="P05",
+        run_id="run-cleanup-split-001",
+        aws_account_id="1234****9012",
+        aws_region="us-east-1",
+        resources=[
+            TrackedResource(
+                resource_type="s3-bucket",
+                resource_id="already-absent-bucket",
+                resource_name="already-absent-bucket",
+            ),
+            TrackedResource(
+                resource_type="dynamodb-table",
+                resource_id="deleted-table",
+                resource_name="deleted-table",
+            ),
+        ],
+    )
+
+    mock_s3 = MagicMock()
+    mock_dynamodb = MagicMock()
+
+    # S3 bucket is already absent prior to cleanup (ownership check encounters NoSuchBucket)
+    mock_s3.get_bucket_tagging.side_effect = ClientError({"Error": {"Code": "NoSuchBucket"}}, "GetBucketTagging")
+
+    # DynamoDB table is present and owned, deletion succeeds
+    mock_dynamodb.describe_table.return_value = {
+        "Table": {"TableArn": "arn:aws:dynamodb:us-east-1:123456789012:table/deleted-table"}
+    }
+    mock_dynamodb.list_tags_of_resource.return_value = {
+        "Tags": [{"Key": "ManagedBy", "Value": "CloudPrac"}, {"Key": "RunId", "Value": "run-cleanup-split-001"}]
+    }
+    mock_dynamodb.delete_table.return_value = {}
+
+    adapter = AWSAdapter(region_name="us-east-1", mock_mode=False)
+    adapter.get_caller_identity = MagicMock(return_value={"Account": "123456789012"})
+
+    def mock_get_client(service, region_name=None):
+        return {"s3": mock_s3, "dynamodb": mock_dynamodb, "ec2": MagicMock(), "iam": MagicMock()}[service]
+
+    adapter.get_client = mock_get_client
+
+    cleanup_res = p05.cleanup(manifest, adapter)
+
+    assert cleanup_res.success is True
+    assert "s3-bucket:already-absent-bucket" in cleanup_res.resources_absent
+    assert "dynamodb-table:deleted-table" in cleanup_res.resources_deleted
+    assert len(cleanup_res.resources_failed) == 0
+
+
+def test_cleanup_drains_s3_versions_and_delete_markers():
+    """Verify cleanup_s3_resources drains both object versions and delete markers to prevent BucketNotEmpty."""
+    mock_s3 = MagicMock()
+
+    mock_s3.get_bucket_tagging.return_value = {
+        "TagSet": [{"Key": "ManagedBy", "Value": "CloudPrac"}, {"Key": "RunId", "Value": "run-version-test"}]
+    }
+    mock_s3.list_objects_v2.return_value = {"Contents": []}
+    mock_s3.list_object_versions.return_value = {
+        "Versions": [{"Key": "doc1.txt", "VersionId": "v1"}, {"Key": "doc1.txt", "VersionId": "v2"}],
+        "DeleteMarkers": [{"Key": "doc1.txt", "VersionId": "dm1"}],
+    }
+    mock_s3.delete_objects.return_value = {}
+    mock_s3.delete_bucket.return_value = {}
+
+    deleted = cleanup_s3_resources(
+        s3_client=mock_s3,
+        bucket_name="versioned-test-bucket",
+        expected_run_id="run-version-test",
+    )
+
+    assert "s3-bucket:versioned-test-bucket" in deleted
+    assert mock_s3.delete_objects.called
+    call_args = mock_s3.delete_objects.call_args[1]
+    deleted_items = call_args["Delete"]["Objects"]
+    assert len(deleted_items) == 3
+    keys_deleted = [item["Key"] for item in deleted_items]
+    assert "doc1.txt" in keys_deleted
+    assert mock_s3.delete_bucket.called
+
+
+def test_cleanup_s3_handles_paginated_versions_and_delete_markers():
+    """Verify cleanup_s3_resources handles paginated list_object_versions calls."""
+    mock_s3 = MagicMock()
+    mock_s3.get_bucket_tagging.return_value = {
+        "TagSet": [{"Key": "ManagedBy", "Value": "CloudPrac"}, {"Key": "RunId", "Value": "run-page-test"}]
+    }
+    mock_s3.list_objects_v2.return_value = {"Contents": []}
+
+    # Page 1 truncated, Page 2 final
+    mock_s3.list_object_versions.side_effect = [
+        {
+            "IsTruncated": True,
+            "NextKeyMarker": "page1-doc.txt",
+            "NextVersionIdMarker": "ver-page-1",
+            "Versions": [{"Key": "page1-doc.txt", "VersionId": "v1"}],
+            "DeleteMarkers": [{"Key": "page1-marker.txt", "VersionId": "dm1"}],
+        },
+        {
+            "IsTruncated": False,
+            "Versions": [{"Key": "page2-doc.txt", "VersionId": "v2"}],
+            "DeleteMarkers": [],
+        },
+    ]
+    mock_s3.delete_objects.return_value = {}
+    mock_s3.delete_bucket.return_value = {}
+
+    deleted = cleanup_s3_resources(
+        s3_client=mock_s3,
+        bucket_name="paginated-test-bucket",
+        expected_run_id="run-page-test",
+    )
+
+    assert "s3-bucket:paginated-test-bucket" in deleted
+    assert mock_s3.list_object_versions.call_count == 2
+    # Verify second page used KeyMarker and VersionIdMarker
+    second_call_kwargs = mock_s3.list_object_versions.call_args_list[1][1]
+    assert second_call_kwargs.get("KeyMarker") == "page1-doc.txt"
+    assert second_call_kwargs.get("VersionIdMarker") == "ver-page-1"
+    assert mock_s3.delete_objects.call_count == 2
+
+
+def test_cleanup_s3_fails_and_raises_when_delete_objects_returns_errors():
+    """Verify cleanup_s3_resources raises RuntimeError when delete_objects reports errors."""
+    mock_s3 = MagicMock()
+    mock_s3.get_bucket_tagging.return_value = {
+        "TagSet": [{"Key": "ManagedBy", "Value": "CloudPrac"}, {"Key": "RunId", "Value": "run-err-test"}]
+    }
+    mock_s3.list_objects_v2.return_value = {"Contents": [{"Key": "protected-doc.txt"}]}
+    mock_s3.delete_objects.return_value = {
+        "Errors": [
+            {"Key": "protected-doc.txt", "Code": "AccessDenied", "Message": "Access Denied"}
+        ]
+    }
+
+    with pytest.raises(RuntimeError) as exc_info:
+        cleanup_s3_resources(
+            s3_client=mock_s3,
+            bucket_name="err-bucket",
+            expected_run_id="run-err-test",
+        )
+    assert "Failed to delete 1 objects from 'err-bucket'" in str(exc_info.value)
+    assert "AccessDenied" in str(exc_info.value)
+    # Ensure delete_bucket is not called when object deletion fails
+    assert not mock_s3.delete_bucket.called
+
+
+def test_cleanup_s3_does_not_swallow_client_error_during_version_listing():
+    """Verify cleanup_s3_resources propagates ClientError instead of swallowing exceptions."""
+    mock_s3 = MagicMock()
+    mock_s3.get_bucket_tagging.return_value = {
+        "TagSet": [{"Key": "ManagedBy", "Value": "CloudPrac"}, {"Key": "RunId", "Value": "run-s3-fail"}]
+    }
+    mock_s3.list_objects_v2.return_value = {"Contents": []}
+    mock_s3.list_object_versions.side_effect = ClientError(
+        {"Error": {"Code": "InternalError", "Message": "S3 failure"}},
+        "ListObjectVersions",
+    )
+
+    with pytest.raises(ClientError) as exc_info:
+        cleanup_s3_resources(
+            s3_client=mock_s3,
+            bucket_name="s3-fail-bucket",
+            expected_run_id="run-s3-fail",
+        )
+    assert exc_info.value.response["Error"]["Code"] == "InternalError"
+    assert not mock_s3.delete_bucket.called
+
+
+def test_cleanup_result_model_validator_never_allows_success_with_failed_or_unverified_resources():
+    """Ensure CleanupResult model validation forces success=False whenever failures exist."""
+    res1 = CleanupResult(
+        success=True,
+        run_id="run-1",
+        practical_id="P05",
+        resources_failed=["s3-bucket:b1"],
+    )
+    assert res1.success is False
+
+    res2 = CleanupResult(
+        success=True,
+        run_id="run-2",
+        practical_id="P05",
+        resources_unverified=["ec2-instance:i-123"],
+    )
+    assert res2.success is False
+
+    res3 = CleanupResult(
+        success=True,
+        run_id="run-3",
+        practical_id="P05",
+        errors=["Database connection failed"],
+    )
+    assert res3.success is False
+
+    # Fully successful cleanup without failures
+    res4 = CleanupResult(
+        success=True,
+        run_id="run-4",
+        practical_id="P05",
+        resources_deleted=["s3-bucket:b1"],
+        resources_absent=["dynamodb-table:tbl1"],
+    )
+    assert res4.success is True
